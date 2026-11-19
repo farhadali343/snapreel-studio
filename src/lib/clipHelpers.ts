@@ -1,5 +1,15 @@
 import type { VideoPlatform, WordToken } from '../types/clip';
 
+/** Permanent Colab backend URL (ngrok static domain). The site ships with
+ *  this pre-filled so the user never has to paste a tunnel URL. */
+export const DEFAULT_BACKEND_URL = 'https://frenzy-parmesan-swimsuit.ngrok-free.dev';
+
+/** Headers every backend request must carry. ngrok's free tier serves a
+ *  browser-warning interstitial unless this header is present. */
+export function backendHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  return { 'ngrok-skip-browser-warning': 'true', ...extra };
+}
+
 export function normalizeBackendUrl(rawUrl: string): string {
   return rawUrl.trim().replace(/\/+$/, '');
 }
