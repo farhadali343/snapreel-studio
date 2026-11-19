@@ -8,6 +8,24 @@ import { ResultsDashboard } from './components/ResultsDashboard';
 import { BackendSetupSection } from './components/BackendSetupSection';
 
 const COLAB_STORAGE_KEY = 'snapreel_colab_backend_url';
+const DEFAULT_COLAB_URL = 'https://frenzy-parmesan-swimsuit.ngrok-free.dev';
+const OFFLINE_FRIENDLY_MESSAGE =
+  "Backend is offline — ask Muse to turn on Colab (say 'Colab on karo'), then press Connect & Test again.";
+const NGROK_HEADERS: Record<string, string> = {
+  'ngrok-skip-browser-warning': 'true',
+};
+
+function isFetchConnectivityFailure(err: unknown): boolean {
+  if (!(err instanceof Error)) return true;
+  const msg = err.message.toLowerCase();
+  return (
+    err.name === 'TypeError' ||
+    msg.includes('failed to fetch') ||
+    msg.includes('networkerror') ||
+    msg.includes('network request failed') ||
+    msg.includes('load failed')
+  );
+}
 
 export default function App() {
   const urlInputRef = useRef<HTMLInputElement | null>(null);
@@ -21,9 +39,14 @@ export default function App() {
 
   const [colabUrl, setColabUrl] = useState<string>(() => {
     try {
-      return window.localStorage.getItem(COLAB_STORAGE_KEY) ?? '';
+      const saved = window.localStorage.getItem(COLAB_STORAGE_KEY);
+      if (saved && saved.trim().length > 0) {
+        return saved;
+      }
+      window.localStorage.setItem(COLAB_STORAGE_KEY, DEFAULT_COLAB_URL);
+      return DEFAULT_COLAB_URL;
     } catch {
-      return '';
+      return DEFAULT_COLAB_URL;
     }
   });
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('idle');
@@ -36,7 +59,8 @@ export default function App() {
 
   useEffect(() => {
     try {
-      window.localStorage.setItem(COLAB_STORAGE_KEY, colabUrl);
+      const valueToStore = colabUrl.trim().length > 0 ? colabUrl : DEFAULT_COLAB_URL;
+      window.localStorage.setItem(COLAB_STORAGE_KEY, valueToStore);
     } catch {
       // Ignore storage quota / privacy errors
     }
@@ -68,7 +92,9 @@ export default function App() {
     const baseUrl = normalizeBackendUrl(colabUrl);
     if (!baseUrl) {
       setConnectionStatus('error');
-      setConnectionError('Please paste your Colab tunnel URL (e.g. https://xxxx.trycloudflare.com).');
+      setConnectionError(
+        `Please enter your Colab backend URL (default: ${DEFAULT_COLAB_URL}).`
+      );
       return;
     }
 
@@ -76,7 +102,7 @@ export default function App() {
       new URL(baseUrl);
     } catch {
       setConnectionStatus('error');
-      setConnectionError('Invalid URL format. Include https:// at the start of the tunnel URL.');
+      setConnectionError('Invalid URL format. Include https:// at the start of the backend URL.');
       return;
     }
 
@@ -86,20 +112,21 @@ export default function App() {
     try {
       const response = await fetch(`${baseUrl}/health`, {
         method: 'GET',
-        headers: { Accept: 'application/json' },
+        headers: {
+          Accept: 'application/json',
+          ...NGROK_HEADERS,
+        },
       });
       if (!response.ok) {
-        throw new Error(`Health check returned HTTP ${response.status}`);
+        setConnectionStatus('error');
+        setConnectionError(OFFLINE_FRIENDLY_MESSAGE);
+        return;
       }
       setConnectionStatus('connected');
       setConnectionError(null);
-    } catch (err) {
+    } catch {
       setConnectionStatus('error');
-      setConnectionError(
-        err instanceof Error
-          ? `Could not connect to ${baseUrl}/health: ${err.message}`
-          : `Could not reach ${baseUrl}/health. Make sure the Colab tunnel is running.`
-      );
+      setConnectionError(OFFLINE_FRIENDLY_MESSAGE);
     }
   };
 
@@ -108,7 +135,13 @@ export default function App() {
 
     const fetchStatus = async () => {
       try {
-        const res = await fetch(`${apiBase}/api/status/${encodeURIComponent(jobId)}`);
+        const res = await fetch(`${apiBase}/api/status/${encodeURIComponent(jobId)}`, {
+          method: 'GET',
+          headers: {
+            Accept: 'application/json',
+            ...NGROK_HEADERS,
+          },
+        });
         if (!res.ok) {
           throw new Error(`Status check failed (${res.status})`);
         }
@@ -131,15 +164,17 @@ export default function App() {
         }
       } catch (err) {
         stopPolling();
+        const message = isFetchConnectivityFailure(err)
+          ? OFFLINE_FRIENDLY_MESSAGE
+          : err instanceof Error
+            ? err.message
+            : OFFLINE_FRIENDLY_MESSAGE;
         setActiveJob((prev) =>
           prev
             ? {
                 ...prev,
                 status: 'failed',
-                errorMessage:
-                  err instanceof Error
-                    ? err.message
-                    : 'Lost connection to Colab backend server.',
+                errorMessage: message,
               }
             : null
         );
@@ -154,10 +189,15 @@ export default function App() {
     setValidationError(null);
     const apiBase = normalizeBackendUrl(colabUrl);
 
-    if (!apiBase) {
+    if (connectionStatus !== 'connected') {
       setValidationError(
-        'Please enter your Colab backend URL (e.g. https://xxxx.trycloudflare.com) first.'
+        'Please press Connect & Test to verify the backend is ready before generating clips.'
       );
+      return;
+    }
+
+    if (!apiBase) {
+      setValidationError(`Please enter your Colab backend URL (default: ${DEFAULT_COLAB_URL}).`);
       return;
     }
 
@@ -203,12 +243,18 @@ export default function App() {
         formData.append('num_clips', String(numClips));
         response = await fetch(`${apiBase}/api/upload-video`, {
           method: 'POST',
+          headers: {
+            ...NGROK_HEADERS,
+          },
           body: formData,
         });
       } else {
         response = await fetch(`${apiBase}/api/process-url`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...NGROK_HEADERS,
+          },
           body: JSON.stringify({
             url: effectiveUrl,
             clip_duration: targetDuration,
@@ -228,11 +274,15 @@ export default function App() {
       document.getElementById('pipeline')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
       startPolling(payload.jobId, apiBase);
     } catch (err) {
-      setValidationError(
-        err instanceof Error
-          ? `${err.message} (Check that your Colab backend is active at ${apiBase})`
-          : `Could not reach Colab backend at ${apiBase}.`
-      );
+      if (isFetchConnectivityFailure(err)) {
+        setConnectionStatus('error');
+        setConnectionError(OFFLINE_FRIENDLY_MESSAGE);
+        setValidationError(OFFLINE_FRIENDLY_MESSAGE);
+      } else {
+        setValidationError(
+          err instanceof Error ? err.message : OFFLINE_FRIENDLY_MESSAGE
+        );
+      }
     } finally {
       setIsSubmitting(false);
     }
@@ -297,8 +347,8 @@ export default function App() {
         <BackendSetupSection />
       </main>
 
-      <footer className="border-t border-slate-200 bg-white py-6">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-slate-500">
+      <footer className="border-t border-slate-200 bg-white py-5">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-500">
           <span>SnapReel Studio · 9:16 Vertical Short-Form Clipper</span>
           <span>Supports YouTube, Twitch, Kick, and Local MP4</span>
         </div>

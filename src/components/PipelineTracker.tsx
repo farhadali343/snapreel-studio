@@ -49,24 +49,34 @@ const DEFAULT_STEPS: PipelineStep[] = [
 export const PipelineTracker: React.FC<PipelineTrackerProps> = ({ job, onRetry }) => {
   const steps = job?.steps ?? DEFAULT_STEPS;
   const progress = job?.progressPercent ?? 0;
-  const activeStep = steps.find((s) => s.state === 'active') ?? steps[job?.currentStepIndex ?? 0];
+  const activeStepIndex = steps.findIndex((s) => s.state === 'active');
+  const resolvedIndex = activeStepIndex !== -1 ? activeStepIndex : (job?.currentStepIndex ?? 0);
+  const activeStep = steps[resolvedIndex] ?? steps[0];
 
-  const statusText = !job
+  const liveStageBadge = !job
+    ? 'Idle'
+    : job.status === 'completed'
+      ? 'Completed'
+      : job.status === 'failed'
+        ? 'Failed'
+        : `Stage ${resolvedIndex + 1} of ${steps.length} · ${activeStep.label}`;
+
+  const statusHeading = !job
     ? 'Ready to process'
     : job.status === 'completed'
       ? `Completed · ${job.clips.length} vertical clips ready`
       : job.status === 'failed'
-        ? 'Pipeline interrupted'
-        : `${activeStep?.label ?? 'Processing'} (${progress}%)`;
+        ? `Interrupted at ${activeStep?.label ?? 'Pipeline'}`
+        : `${activeStep?.label ?? 'Processing'} (${activeStep?.toolTag ?? 'Pipeline'})`;
 
   return (
-    <section id="pipeline" className="py-6 sm:py-8">
+    <section id="pipeline" className="py-4 sm:py-6">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="bg-white border border-slate-200 rounded-2xl p-6 sm:p-8 shadow-sm">
-          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6">
-            <div>
-              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 mb-1">
-                <span>Processing Pipeline</span>
+        <div className="bg-white border border-slate-200 rounded-2xl p-4 sm:p-6 shadow-sm">
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-5">
+            <div className="space-y-1">
+              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                <span className="font-semibold text-indigo-600">{liveStageBadge}</span>
                 {job && (
                   <>
                     <span aria-hidden="true">·</span>
@@ -80,11 +90,16 @@ export const PipelineTracker: React.FC<PipelineTrackerProps> = ({ job, onRetry }
                   </>
                 )}
               </div>
-              <h2 className="font-display text-xl font-bold text-slate-900">{statusText}</h2>
+              <h2 className="font-display text-lg sm:text-xl font-bold text-slate-900">
+                {statusHeading}
+              </h2>
+              {job && job.status !== 'completed' && job.status !== 'failed' && activeStep?.detail && (
+                <p className="text-xs text-slate-600">{activeStep.detail}</p>
+              )}
             </div>
 
-            <div className="flex items-center gap-4">
-              <div className="w-40 sm:w-52 h-2 bg-slate-100 rounded-full overflow-hidden">
+            <div className="flex items-center gap-3 w-full md:w-auto">
+              <div className="flex-1 md:w-48 h-2.5 bg-slate-100 rounded-full overflow-hidden">
                 <div
                   className={`h-full transition-all duration-300 ${
                     job?.status === 'failed'
@@ -96,7 +111,7 @@ export const PipelineTracker: React.FC<PipelineTrackerProps> = ({ job, onRetry }
                   style={{ width: `${progress}%` }}
                 />
               </div>
-              <span className="font-mono-tabular text-sm font-semibold text-slate-800 w-11 text-right">
+              <span className="font-mono-tabular text-sm font-bold text-slate-800 w-11 text-right shrink-0">
                 {progress}%
               </span>
             </div>
@@ -105,7 +120,7 @@ export const PipelineTracker: React.FC<PipelineTrackerProps> = ({ job, onRetry }
           {job?.status === 'failed' && job.errorMessage && (
             <div
               role="alert"
-              className="mb-6 flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-4 py-3 bg-red-50 border border-red-200 rounded-xl text-sm text-red-800"
+              className="mb-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-4 py-3 bg-red-50 border border-red-200 rounded-xl text-sm text-red-800"
             >
               <div className="flex items-start sm:items-center gap-2.5">
                 <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5 sm:mt-0" />
@@ -122,8 +137,8 @@ export const PipelineTracker: React.FC<PipelineTrackerProps> = ({ job, onRetry }
             </div>
           )}
 
-          {/* 5-Stage Horizontal Stepper */}
-          <ol className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+          {/* 5-Stage Responsive Stepper */}
+          <ol className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
             {steps.map((step, index) => {
               const isCompleted = step.state === 'completed';
               const isActive = step.state === 'active';
@@ -132,9 +147,9 @@ export const PipelineTracker: React.FC<PipelineTrackerProps> = ({ job, onRetry }
               return (
                 <li
                   key={step.key}
-                  className={`relative rounded-xl border p-4 transition-colors ${
+                  className={`relative rounded-xl border p-3.5 transition-colors ${
                     isActive
-                      ? 'border-indigo-300 bg-indigo-50/40'
+                      ? 'border-indigo-300 bg-indigo-50/50 ring-1 ring-indigo-200'
                       : isCompleted
                         ? 'border-emerald-200 bg-emerald-50/30'
                         : isFailed
@@ -142,12 +157,12 @@ export const PipelineTracker: React.FC<PipelineTrackerProps> = ({ job, onRetry }
                           : 'border-slate-200 bg-slate-50/60'
                   }`}
                 >
-                  <div className="flex items-center justify-between gap-2 mb-2.5">
-                    <span className="font-mono-tabular text-xs font-medium text-slate-500">
+                  <div className="flex items-center justify-between gap-2 mb-2">
+                    <span className="font-mono-tabular text-[11px] font-medium text-slate-500">
                       0{index + 1} · {step.toolTag}
                     </span>
                     <span
-                      className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-semibold ${
+                      className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-semibold shrink-0 ${
                         isCompleted
                           ? 'bg-emerald-600 text-white'
                           : isActive
