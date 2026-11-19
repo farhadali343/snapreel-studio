@@ -1,6 +1,6 @@
 export type VideoPlatform = 'youtube' | 'twitch' | 'kick' | 'local';
 
-export type TargetDuration = 15 | 30 | 45 | 60;
+export type TargetDuration = number;
 
 export type StepState = 'pending' | 'active' | 'completed' | 'failed';
 
