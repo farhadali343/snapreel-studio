@@ -202,7 +202,12 @@ def download_audio(url: str, out_dir: Path) -> Path:
     """Audio-only download, then convert to 16 kHz mono WAV for Whisper."""
     out_dir.mkdir(parents=True, exist_ok=True)
     raw_tpl = str(out_dir / "audio.%(ext)s")
-    run(["yt-dlp", "--no-playlist", "-f", "bestaudio/best",
+    # YouTube blocks yt-dlp's default web client from Colab datacenter IPs
+    # ("Sign in to confirm you're not a bot", 2026-11-20) — the Android
+    # player client bypasses that check. Ignored for non-YouTube URLs.
+    run(["yt-dlp", "--no-playlist",
+         "--extractor-args", "youtube:player_client=android",
+         "-f", "bestaudio/best",
          "-o", raw_tpl, url], "yt-dlp audio download")
     raw = next((p for p in out_dir.glob("audio.*")
                 if p.suffix.lower() in (".m4a", ".opus", ".webm", ".mp3",
@@ -1022,7 +1027,9 @@ def download_segment(url: str, start: float, end: float,
              "-c", "copy", "-movflags", "+faststart", str(out_path)],
             "ffmpeg direct-mp4 segment cut")
         return out_path
-    run(["yt-dlp", "--no-playlist", "--download-sections",
+    run(["yt-dlp", "--no-playlist",
+         "--extractor-args", "youtube:player_client=android",
+         "--download-sections",
          f"*{fmt_hms(start)}-{fmt_hms(end)}",
          "-f", "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]",
          "--merge-output-format", "mp4", "-o", str(out_path), url],
