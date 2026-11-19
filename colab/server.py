@@ -1334,8 +1334,8 @@ def run_job(job: Dict[str, Any]) -> None:
 
 class ProcessUrlRequest(BaseModel):
     url: str
-    clip_duration: int = 30       # seconds per clip: 15/30/45/60 or custom
-    num_clips: int = 5            # 1-10
+    clip_duration: int = 30       # seconds per clip: 10-180 (custom allowed)
+    num_clips: int = 5            # 1-20
     mode: str = "gemini"          # "gemini" or "fallback"
     context_notes: Optional[str] = None
 
@@ -1371,8 +1371,8 @@ def process_url(req: ProcessUrlRequest) -> Dict[str, Any]:
     url = (req.url or "").strip()
     if not url or not url.startswith("http"):
         raise HTTPException(400, "A video URL is required.")
-    duration = max(10, min(90, int(req.clip_duration)))
-    num_clips = max(1, min(10, int(req.num_clips)))
+    duration = max(10, min(180, int(req.clip_duration)))
+    num_clips = max(1, min(20, int(req.num_clips)))
     mode = req.mode if req.mode in ("gemini", "fallback") else "gemini"
     job = new_job(url, duration, num_clips, mode, req.context_notes)
     EXECUTOR.submit(run_job, job)
