@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ClipJob, GeneratedClip, TargetDuration } from './types/clip';
-import { detectVideoPlatform, normalizeBackendUrl } from './lib/clipHelpers';
+import { detectVideoPlatform, normalizeBackendUrl, backendHeaders, DEFAULT_BACKEND_URL } from './lib/clipHelpers';
 import { Navbar } from './components/Navbar';
 import { HeroInput, type ConnectionStatus } from './components/HeroInput';
 import { PipelineTracker } from './components/PipelineTracker';
@@ -8,24 +8,6 @@ import { ResultsDashboard } from './components/ResultsDashboard';
 import { BackendSetupSection } from './components/BackendSetupSection';
 
 const COLAB_STORAGE_KEY = 'snapreel_colab_backend_url';
-const DEFAULT_COLAB_URL = 'https://frenzy-parmesan-swimsuit.ngrok-free.dev';
-const OFFLINE_FRIENDLY_MESSAGE =
-  "Backend is offline — ask Muse to turn on Colab (say 'Colab on karo'), then press Connect & Test again.";
-const NGROK_HEADERS: Record<string, string> = {
-  'ngrok-skip-browser-warning': 'true',
-};
-
-function isFetchConnectivityFailure(err: unknown): boolean {
-  if (!(err instanceof Error)) return true;
-  const msg = err.message.toLowerCase();
-  return (
-    err.name === 'TypeError' ||
-    msg.includes('failed to fetch') ||
-    msg.includes('networkerror') ||
-    msg.includes('network request failed') ||
-    msg.includes('load failed')
-  );
-}
 
 export default function App() {
   const urlInputRef = useRef<HTMLInputElement | null>(null);
@@ -39,14 +21,13 @@ export default function App() {
 
   const [colabUrl, setColabUrl] = useState<string>(() => {
     try {
-      const saved = window.localStorage.getItem(COLAB_STORAGE_KEY);
-      if (saved && saved.trim().length > 0) {
-        return saved;
-      }
-      window.localStorage.setItem(COLAB_STORAGE_KEY, DEFAULT_COLAB_URL);
-      return DEFAULT_COLAB_URL;
+      const stored = window.localStorage.getItem(COLAB_STORAGE_KEY);
+      // A stored trycloudflare URL dies with every Colab restart — fall back
+      // to the permanent ngrok URL instead of showing a dead tunnel.
+      if (stored && !stored.includes('trycloudflare.com')) return stored;
+      return DEFAULT_BACKEND_URL;
     } catch {
-      return DEFAULT_COLAB_URL;
+      return DEFAULT_BACKEND_URL;
     }
   });
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('idle');
@@ -59,8 +40,7 @@ export default function App() {
 
   useEffect(() => {
     try {
-      const valueToStore = colabUrl.trim().length > 0 ? colabUrl : DEFAULT_COLAB_URL;
-      window.localStorage.setItem(COLAB_STORAGE_KEY, valueToStore);
+      window.localStorage.setItem(COLAB_STORAGE_KEY, colabUrl);
     } catch {
       // Ignore storage quota / privacy errors
     }
@@ -92,9 +72,7 @@ export default function App() {
     const baseUrl = normalizeBackendUrl(colabUrl);
     if (!baseUrl) {
       setConnectionStatus('error');
-      setConnectionError(
-        `Please enter your Colab backend URL (default: ${DEFAULT_COLAB_URL}).`
-      );
+      setConnectionError('Please enter your Colab backend URL — the permanent URL is already filled in above.');
       return;
     }
 
@@ -102,7 +80,7 @@ export default function App() {
       new URL(baseUrl);
     } catch {
       setConnectionStatus('error');
-      setConnectionError('Invalid URL format. Include https:// at the start of the backend URL.');
+      setConnectionError('Invalid URL format. Include https:// at the start of the tunnel URL.');
       return;
     }
 
@@ -112,23 +90,37 @@ export default function App() {
     try {
       const response = await fetch(`${baseUrl}/health`, {
         method: 'GET',
-        headers: {
-          Accept: 'application/json',
-          ...NGROK_HEADERS,
-        },
+        headers: backendHeaders({ Accept: 'application/json' }),
       });
       if (!response.ok) {
         setConnectionStatus('error');
-        setConnectionError(OFFLINE_FRIENDLY_MESSAGE);
+        setConnectionError(
+          `Backend replied with HTTP ${response.status}. Try Connect & Test again, or ask Muse to restart Colab.`
+        );
         return;
       }
       setConnectionStatus('connected');
       setConnectionError(null);
     } catch {
       setConnectionStatus('error');
-      setConnectionError(OFFLINE_FRIENDLY_MESSAGE);
+      setConnectionError(
+        'Backend is offline — ask Muse to turn on Colab (say "Colab on karo"), then press Connect & Test again.'
+      );
     }
   };
+
+  // The backend URL is pre-filled with the permanent ngrok address, so test
+  // the connection once on load — the user should see "Connected" without
+  // having to press anything.
+  const didAutoTestRef = useRef(false);
+  useEffect(() => {
+    if (!didAutoTestRef.current && colabUrl) {
+      didAutoTestRef.current = true;
+      void handleTestConnection();
+    }
+    // Runs once on mount only.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const startPolling = (jobId: string, apiBase: string) => {
     stopPolling();
@@ -136,11 +128,7 @@ export default function App() {
     const fetchStatus = async () => {
       try {
         const res = await fetch(`${apiBase}/api/status/${encodeURIComponent(jobId)}`, {
-          method: 'GET',
-          headers: {
-            Accept: 'application/json',
-            ...NGROK_HEADERS,
-          },
+          headers: backendHeaders(),
         });
         if (!res.ok) {
           throw new Error(`Status check failed (${res.status})`);
@@ -164,17 +152,15 @@ export default function App() {
         }
       } catch (err) {
         stopPolling();
-        const message = isFetchConnectivityFailure(err)
-          ? OFFLINE_FRIENDLY_MESSAGE
-          : err instanceof Error
-            ? err.message
-            : OFFLINE_FRIENDLY_MESSAGE;
         setActiveJob((prev) =>
           prev
             ? {
                 ...prev,
                 status: 'failed',
-                errorMessage: message,
+                errorMessage:
+                  err instanceof Error
+                    ? err.message
+                    : 'Lost connection to Colab backend server.',
               }
             : null
         );
@@ -189,15 +175,10 @@ export default function App() {
     setValidationError(null);
     const apiBase = normalizeBackendUrl(colabUrl);
 
-    if (connectionStatus !== 'connected') {
-      setValidationError(
-        'Please press Connect & Test to verify the backend is ready before generating clips.'
-      );
-      return;
-    }
-
     if (!apiBase) {
-      setValidationError(`Please enter your Colab backend URL (default: ${DEFAULT_COLAB_URL}).`);
+      setValidationError(
+        'Please enter your Colab backend URL first — the permanent URL is already filled in above.'
+      );
       return;
     }
 
@@ -243,18 +224,13 @@ export default function App() {
         formData.append('num_clips', String(numClips));
         response = await fetch(`${apiBase}/api/upload-video`, {
           method: 'POST',
-          headers: {
-            ...NGROK_HEADERS,
-          },
+          headers: backendHeaders(),
           body: formData,
         });
       } else {
         response = await fetch(`${apiBase}/api/process-url`, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...NGROK_HEADERS,
-          },
+          headers: backendHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({
             url: effectiveUrl,
             clip_duration: targetDuration,
@@ -274,15 +250,11 @@ export default function App() {
       document.getElementById('pipeline')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
       startPolling(payload.jobId, apiBase);
     } catch (err) {
-      if (isFetchConnectivityFailure(err)) {
-        setConnectionStatus('error');
-        setConnectionError(OFFLINE_FRIENDLY_MESSAGE);
-        setValidationError(OFFLINE_FRIENDLY_MESSAGE);
-      } else {
-        setValidationError(
-          err instanceof Error ? err.message : OFFLINE_FRIENDLY_MESSAGE
-        );
-      }
+      setValidationError(
+        err instanceof Error
+          ? `${err.message} (Check that your Colab backend is active at ${apiBase})`
+          : `Could not reach Colab backend at ${apiBase}.`
+      );
     } finally {
       setIsSubmitting(false);
     }
@@ -347,8 +319,8 @@ export default function App() {
         <BackendSetupSection />
       </main>
 
-      <footer className="border-t border-slate-200 bg-white py-5">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-500">
+      <footer className="border-t border-slate-200 bg-white py-6">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-slate-500">
           <span>SnapReel Studio · 9:16 Vertical Short-Form Clipper</span>
           <span>Supports YouTube, Twitch, Kick, and Local MP4</span>
         </div>
