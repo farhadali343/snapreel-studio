@@ -1,0 +1,63 @@
+export type VideoPlatform = 'youtube' | 'twitch' | 'kick' | 'local';
+
+export type TargetDuration = 15 | 30 | 45 | 60;
+
+export type StepState = 'pending' | 'active' | 'completed' | 'failed';
+
+export type PipelineStageKey =
+  | 'downloading'
+  | 'transcribing'
+  | 'scoring'
+  | 'cropping'
+  | 'burning';
+
+export interface PipelineStep {
+  key: PipelineStageKey;
+  label: string;
+  toolTag: string;
+  detail: string;
+  state: StepState;
+  durationMs?: number;
+}
+
+export interface WordToken {
+  word: string;
+  start: number;
+  end: number;
+}
+
+export interface GeneratedClip {
+  id: string;
+  title: string;
+  viralityScore: number;
+  hookReasoning: string;
+  retentionInsight: string;
+  pacingNote: string;
+  durationSec: number;
+  startTimeSec: number;
+  endTimeSec: number;
+  aspectRatio: '9:16';
+  resolution: '1080x1920';
+  videoUrl?: string;
+  downloadUrl?: string;
+  transcript: string;
+  words: WordToken[];
+  speakerFocusX?: number;
+}
+
+export interface ClipJob {
+  jobId: string;
+  sourceType: 'url' | 'file';
+  sourceUrl?: string;
+  fileName?: string;
+  platform: VideoPlatform;
+  targetDuration: TargetDuration;
+  numClips: number;
+  status: 'queued' | 'processing' | 'completed' | 'failed';
+  currentStepIndex: number;
+  progressPercent: number;
+  steps: PipelineStep[];
+  clips: GeneratedClip[];
+  errorMessage?: string;
+  createdAt: string;
+}
