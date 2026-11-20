@@ -1,6 +1,15 @@
-export type VideoPlatform = 'youtube' | 'twitch' | 'kick' | 'local';
+export type VideoPlatform =
+  | 'youtube'
+  | 'twitch'
+  | 'kick'
+  | 'local'
+  | 'direct-mp4'
+  | 'frameio'
+  | 'upload';
 
 export type TargetDuration = number;
+
+export type CaptionStyleId = 'karaoke' | 'bold-white' | 'pop';
 
 export type StepState = 'pending' | 'active' | 'completed' | 'failed';
 
@@ -43,6 +52,7 @@ export interface GeneratedClip {
   transcript: string;
   words: WordToken[];
   speakerFocusX?: number;
+  captionStyle?: CaptionStyleId;
 }
 
 export interface ClipJob {
