@@ -10,10 +10,16 @@ import {
   CheckCircle2,
   Loader2,
 } from 'lucide-react';
-import type { TargetDuration } from '../types/clip';
+import type { CaptionStyleId, TargetDuration } from '../types/clip';
 import { detectVideoPlatform, formatPlatformLabel, DEFAULT_BACKEND_URL } from '../lib/clipHelpers';
 
 export type ConnectionStatus = 'idle' | 'testing' | 'connected' | 'error';
+
+export const CAPTION_STYLE_OPTIONS: { id: CaptionStyleId; label: string }[] = [
+  { id: 'karaoke', label: 'Karaoke' },
+  { id: 'bold-white', label: 'Bold white' },
+  { id: 'pop', label: 'Pop' },
+];
 
 interface HeroInputProps {
   sourceMode: 'url' | 'file';
@@ -26,6 +32,14 @@ interface HeroInputProps {
   onTargetDurationChange: (duration: TargetDuration) => void;
   numClips: number;
   onNumClipsChange: (count: number) => void;
+  rangeStartText: string;
+  onRangeStartChange: (val: string) => void;
+  rangeEndText: string;
+  onRangeEndChange: (val: string) => void;
+  captionStyle: CaptionStyleId;
+  onCaptionStyleChange: (style: CaptionStyleId) => void;
+  musicUrl: string;
+  onMusicUrlChange: (val: string) => void;
   colabUrl: string;
   onColabUrlChange: (url: string) => void;
   connectionStatus: ConnectionStatus;
@@ -56,6 +70,14 @@ export const HeroInput: React.FC<HeroInputProps> = ({
   onTargetDurationChange,
   numClips,
   onNumClipsChange,
+  rangeStartText,
+  onRangeStartChange,
+  rangeEndText,
+  onRangeEndChange,
+  captionStyle,
+  onCaptionStyleChange,
+  musicUrl,
+  onMusicUrlChange,
   colabUrl,
   onColabUrlChange,
   connectionStatus,
@@ -371,6 +393,93 @@ export const HeroInput: React.FC<HeroInputProps> = ({
                     </p>
                   </div>
                 )}
+              </div>
+            </div>
+          )}
+
+          {/* Time range, caption style & music — shown as soon as a valid
+              URL is pasted or a file is picked. The range limits the whole
+              job to that part only (no extra time or credits). */}
+          {((sourceMode === 'url' && detectedPlatform) ||
+            (sourceMode === 'file' && selectedFile)) && (
+            <div className="mt-6 pt-5 border-t border-slate-100 space-y-5">
+              <div>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-sm font-medium text-slate-700">
+                    Clip only this part{' '}
+                    <span className="text-slate-400 font-normal">(optional)</span>
+                  </span>
+                  <span className="text-[11px] text-slate-400">
+                    No extra time or credits — only this part is processed
+                  </span>
+                </div>
+                <div className="mt-2 flex flex-col sm:flex-row gap-2.5">
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    value={rangeStartText}
+                    onChange={(e) => onRangeStartChange(e.target.value)}
+                    placeholder="Start — e.g. 1:05:00"
+                    aria-label="Range start time"
+                    className="flex-1 h-11 px-3.5 text-sm font-mono-tabular text-slate-900 placeholder:text-slate-400 bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-600 focus:border-transparent transition-colors"
+                  />
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    value={rangeEndText}
+                    onChange={(e) => onRangeEndChange(e.target.value)}
+                    placeholder="End — e.g. 2:00:00 (blank = video end)"
+                    aria-label="Range end time"
+                    className="flex-1 h-11 px-3.5 text-sm font-mono-tabular text-slate-900 placeholder:text-slate-400 bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-600 focus:border-transparent transition-colors"
+                  />
+                </div>
+                <p className="mt-1.5 text-xs text-slate-500">
+                  Times as MM:SS or HH:MM:SS. Leave blank to clip the whole video.
+                </p>
+              </div>
+
+              <div>
+                <span className="text-sm font-medium text-slate-700">Caption style</span>
+                <div
+                  role="radiogroup"
+                  aria-label="Caption style"
+                  className="mt-2 inline-flex items-center p-1 bg-slate-100 rounded-lg"
+                >
+                  {CAPTION_STYLE_OPTIONS.map((opt) => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      role="radio"
+                      aria-checked={captionStyle === opt.id}
+                      onClick={() => onCaptionStyleChange(opt.id)}
+                      className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                        captionStyle === opt.id
+                          ? 'bg-white text-indigo-700 shadow-sm'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label
+                  htmlFor="music-url-input"
+                  className="text-sm font-medium text-slate-700"
+                >
+                  Background music{' '}
+                  <span className="text-slate-400 font-normal">(optional)</span>
+                </label>
+                <input
+                  id="music-url-input"
+                  type="url"
+                  value={musicUrl}
+                  onChange={(e) => onMusicUrlChange(e.target.value)}
+                  placeholder="https://...mp3 — ducked under the voice"
+                  className="mt-2 w-full h-11 px-3.5 text-sm text-slate-900 placeholder:text-slate-400 bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-600 focus:border-transparent transition-colors"
+                />
               </div>
             </div>
           )}

@@ -11,15 +11,24 @@ import {
   Volume2,
   VolumeX,
   Film,
+  Scissors,
 } from 'lucide-react';
-import type { GeneratedClip } from '../types/clip';
+import type { CaptionStyleId, GeneratedClip } from '../types/clip';
 import { formatTimecode, retokenizeTranscript } from '../lib/clipHelpers';
+import { CAPTION_STYLE_OPTIONS } from './HeroInput';
 
 interface ClipCardProps {
   clip: GeneratedClip;
   jobId: string;
   colabBaseUrl: string;
   onUpdateClip: (clipId: string, updates: Partial<GeneratedClip>) => void;
+  onRetrim?: (
+    clipId: string,
+    startSec: number,
+    endSec: number,
+    captionStyle: CaptionStyleId
+  ) => void;
+  isRetrimming?: boolean;
 }
 
 export const ClipCard: React.FC<ClipCardProps> = ({
@@ -27,6 +36,8 @@ export const ClipCard: React.FC<ClipCardProps> = ({
   jobId,
   colabBaseUrl,
   onUpdateClip,
+  onRetrim,
+  isRetrimming,
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -38,6 +49,13 @@ export const ClipCard: React.FC<ClipCardProps> = ({
   const [draftTitle, setDraftTitle] = useState(clip.title);
   const [draftTranscript, setDraftTranscript] = useState(clip.transcript);
   const [videoError, setVideoError] = useState(false);
+  const [showTrim, setShowTrim] = useState(false);
+  const [draftStartSec, setDraftStartSec] = useState(String(clip.startTimeSec));
+  const [draftEndSec, setDraftEndSec] = useState(String(clip.endTimeSec));
+  const [draftCaptionStyle, setDraftCaptionStyle] = useState<CaptionStyleId>(
+    clip.captionStyle ?? 'karaoke'
+  );
+  const [retrimError, setRetrimError] = useState<string | null>(null);
 
   const backendClipUrl = useMemo(() => {
     const cleanBase = colabBaseUrl.trim().replace(/\/+$/, '');
@@ -54,6 +72,23 @@ export const ClipCard: React.FC<ClipCardProps> = ({
     setDraftTitle(clip.title);
     setDraftTranscript(clip.transcript);
   }, [clip.title, clip.transcript]);
+
+  useEffect(() => {
+    setDraftStartSec(String(clip.startTimeSec));
+    setDraftEndSec(String(clip.endTimeSec));
+    setDraftCaptionStyle(clip.captionStyle ?? 'karaoke');
+  }, [clip.startTimeSec, clip.endTimeSec, clip.captionStyle]);
+
+  const handleRetrim = () => {
+    const s = parseFloat(draftStartSec);
+    const e = parseFloat(draftEndSec);
+    if (!Number.isFinite(s) || !Number.isFinite(e) || s < 0 || e - s < 5) {
+      setRetrimError('Enter a valid range of at least 5 seconds (start < end).');
+      return;
+    }
+    setRetrimError(null);
+    onRetrim?.(clip.id, s, e, draftCaptionStyle);
+  };
 
   useEffect(() => {
     const vid = videoRef.current;
@@ -380,6 +415,77 @@ export const ClipCard: React.FC<ClipCardProps> = ({
             </>
           )}
         </div>
+
+        {/* Trim start/end + caption style + re-render (v2) */}
+        {onRetrim && (
+          <div className="border-t border-slate-100 pt-3">
+            <button
+              type="button"
+              onClick={() => setShowTrim((prev) => !prev)}
+              aria-expanded={showTrim}
+              className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-700 hover:text-indigo-600 transition-colors cursor-pointer"
+            >
+              <Scissors className="w-3.5 h-3.5" aria-hidden="true" />
+              {showTrim ? 'Hide trim options' : 'Trim & re-render'}
+            </button>
+
+            {showTrim && (
+              <div className="mt-3 space-y-2.5">
+                <div className="flex items-center gap-2">
+                  <label className="text-xs text-slate-500 whitespace-nowrap">Start (sec)</label>
+                  <input
+                    type="number"
+                    step={0.1}
+                    min={0}
+                    value={draftStartSec}
+                    onChange={(e) => setDraftStartSec(e.target.value)}
+                    aria-label="Trim start in seconds"
+                    className="w-20 h-9 px-2 text-xs font-mono-tabular font-semibold text-slate-900 bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-600"
+                  />
+                  <label className="text-xs text-slate-500 whitespace-nowrap">End (sec)</label>
+                  <input
+                    type="number"
+                    step={0.1}
+                    min={0}
+                    value={draftEndSec}
+                    onChange={(e) => setDraftEndSec(e.target.value)}
+                    aria-label="Trim end in seconds"
+                    className="w-20 h-9 px-2 text-xs font-mono-tabular font-semibold text-slate-900 bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-600"
+                  />
+                </div>
+                <p className="text-[11px] text-slate-400">
+                  Original video time: {formatTimecode(clip.startTimeSec)} –{' '}
+                  {formatTimecode(clip.endTimeSec)}
+                </p>
+                <div className="flex items-center gap-2">
+                  <select
+                    value={draftCaptionStyle}
+                    onChange={(e) =>
+                      setDraftCaptionStyle(e.target.value as CaptionStyleId)
+                    }
+                    aria-label="Caption style"
+                    className="h-9 px-2 text-xs font-medium text-slate-700 bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-600 cursor-pointer"
+                  >
+                    {CAPTION_STYLE_OPTIONS.map((opt) => (
+                      <option key={opt.id} value={opt.id}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={handleRetrim}
+                    disabled={isRetrimming}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 rounded-lg transition-colors cursor-pointer"
+                  >
+                    {isRetrimming ? 'Re-rendering…' : 'Re-render clip'}
+                  </button>
+                </div>
+                {retrimError && <p className="text-xs text-red-600">{retrimError}</p>}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Direct MP4 Download Link from Colab Backend */}
         <a
