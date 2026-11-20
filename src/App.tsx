@@ -53,6 +53,12 @@ function normalizeClip(raw: unknown): GeneratedClip {
     id: String(r.id ?? ''),
     title: String(r.title ?? 'Untitled clip'),
     viralityScore: Number(r.virality_score ?? r.viralityScore ?? 0),
+    momentType:
+      typeof r.moment_type === 'string'
+        ? r.moment_type
+        : typeof r.momentType === 'string'
+          ? r.momentType
+          : undefined,
     hookReasoning: String(r.hook_reasoning ?? r.hookReasoning ?? ''),
     retentionInsight: String(r.retention_insight ?? r.retentionInsight ?? ''),
     pacingNote: String(r.pacing_note ?? r.pacingNote ?? ''),
