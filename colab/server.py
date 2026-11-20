@@ -61,7 +61,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -73,6 +73,11 @@ WORK_DIR = BASE_DIR / "snapreel-work"          # fast local scratch (ephemeral)
 MODELS_DIR = WORK_DIR / "models"
 DRIVE_ROOT = Path("/content/drive/MyDrive/SnapReel-Clips")
 JOBS_DIR = DRIVE_ROOT / "jobs"                 # checkpoints + finished clips
+COOKIES_FILE = DRIVE_ROOT / "cookies.txt"      # user's exported YouTube
+                                               # cookies (Netscape format),
+                                               # uploaded to Drive by hand;
+                                               # without them YouTube blocks
+                                               # Colab IPs as a bot.
 
 WHISPER_MODEL_NAME = "large-v3-turbo"
 GEMINI_MODEL = "gemini-2.5-flash"
@@ -97,6 +102,24 @@ CAP_ACTIVE = "FFD400"                          # yellow active word
 TITLE_FONT_SIZE = 56
 TITLE_BG = "FFFFFF"
 TITLE_FG = "111111"
+
+# v2 (2026-11-20): jump cuts + caption styles + two-pass scoring.
+FILLER_WORDS = {"um", "uh", "umm", "uhh", "er", "ah", "hmm", "eh", "mmm"}
+SILENCE_CUT_SECONDS = 0.4        # gaps between words longer than this are cut
+SILENCE_KEEP_SECONDS = 0.1       # keep this much silence at each end of a cut
+CAPTION_STYLES = {
+    # karaoke: white words, yellow active word (the v1 look).
+    "karaoke": {"fill": "FFFFFF", "active": "FFD400", "size": 56,
+                "active_size": 66, "outline": 3},
+    # bold-white: everything white, bigger, heavier outline.
+    "bold-white": {"fill": "FFFFFF", "active": "FFFFFF", "size": 60,
+                   "active_size": 72, "outline": 4},
+    # pop: yellow words, white active word, biggest.
+    "pop": {"fill": "FFD400", "active": "FFFFFF", "size": 64,
+            "active_size": 76, "outline": 4},
+}
+GEN_CANDIDATES_PER_CHUNK = 20    # pass 1: candidates generated per chunk
+SCORE_TOP_CANDIDATES = 20        # pass 2: how many top candidates get scored
 
 YUNET_URL = ("https://github.com/opencv/opencv_zoo/raw/main/models/"
              "face_detection_yunet/face_detection_yunet_2023mar.onnx")
@@ -198,23 +221,60 @@ def get_gemini_key() -> str:
 
 # --------------------------------------------------------- audio + text ---
 
-def download_audio(url: str, out_dir: Path) -> Path:
-    """Audio-only download, then convert to 16 kHz mono WAV for Whisper."""
+def cookies_args() -> List[str]:
+    """--cookies for yt-dlp when the user exported his signed-in YouTube
+    cookies to Drive (SnapReel-Clips/cookies.txt). YouTube blocks Colab
+    datacenter IPs outright ('Sign in to confirm you're not a bot',
+    2026-11-20) and the Android player client did NOT bypass it — a
+    logged-in session is the only route that worked. Empty when the file
+    is absent, so Twitch/Kick/direct links are unaffected."""
+    return ["--cookies", str(COOKIES_FILE)] if COOKIES_FILE.exists() else []
+
+
+def download_audio(url: str, out_dir: Path, platform: str = "youtube",
+                   start_sec: float = 0.0,
+                   end_sec: Optional[float] = None) -> Path:
+    """Audio-only download, then convert to 16 kHz mono WAV for Whisper.
+
+    v2: a time range (start_sec/end_sec) downloads ONLY that part of the
+    source (24 h streams: pick a slice, the rest is never fetched), and an
+    uploaded file (platform "upload", url = local path) is read directly.
+    The returned WAV always starts at the range start — callers offset the
+    transcript times back onto the original video timeline.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
+    wav = out_dir / "audio16k.wav"
+    if platform == "upload":
+        cmd = ["ffmpeg", "-y", "-v", "error"]
+        if start_sec > 0 or end_sec is not None:
+            cmd += ["-ss", f"{start_sec:.3f}"]
+            if end_sec is not None:
+                cmd += ["-t", f"{end_sec - start_sec:.3f}"]
+        cmd += ["-i", url, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+                str(wav)]
+        run(cmd, "ffmpeg audio extract from upload")
+        if not wav.exists() or wav.stat().st_size < 1000:
+            raise RuntimeError("uploaded file produced no audio")
+        return wav
     raw_tpl = str(out_dir / "audio.%(ext)s")
-    # YouTube blocks yt-dlp's default web client from Colab datacenter IPs
-    # ("Sign in to confirm you're not a bot", 2026-11-20) — the Android
-    # player client bypasses that check. Ignored for non-YouTube URLs.
-    run(["yt-dlp", "--no-playlist",
-         "--extractor-args", "youtube:player_client=android",
-         "-f", "bestaudio/best",
-         "-o", raw_tpl, url], "yt-dlp audio download")
+    # YouTube blocks yt-dlp from Colab datacenter IPs ("Sign in to confirm
+    # you're not a bot", 2026-11-20). The Android player client was tried
+    # and ALSO blocked — the logged-in cookies (cookies_args) are the
+    # route that unblocks it. Ignored for non-YouTube URLs.
+    cmd = ["yt-dlp", "--no-playlist",
+           "--extractor-args", "youtube:player_client=android"] + cookies_args()
+    if start_sec > 0 or end_sec is not None:
+        section = f"*{fmt_hms(start_sec)}-"
+        if end_sec is not None:
+            section = f"*{fmt_hms(start_sec)}-{fmt_hms(end_sec)}"
+        cmd += ["--download-sections", section]
+    cmd += ["-f", "bestaudio/best", "-o", raw_tpl, url]
+    run(cmd, "yt-dlp audio download")
     raw = next((p for p in out_dir.glob("audio.*")
                 if p.suffix.lower() in (".m4a", ".opus", ".webm", ".mp3",
                                         ".ogg", ".wav", ".aac")), None)
     if raw is None:
         raise RuntimeError("yt-dlp finished but no audio file was produced")
-    wav = out_dir / "audio16k.wav"
     run(["ffmpeg", "-y", "-v", "error", "-i", str(raw),
          "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(wav)],
         "ffmpeg audio to 16k mono wav")
@@ -323,19 +383,20 @@ GEMINI_SYSTEM = (
 GEMINI_PROMPT = """{system}
 
 Transcript chunk [{chunk_start} - {chunk_end}] of a stream (timestamps are
-absolute seconds in the full video). The user wants {num_clips} clips of
-about {duration} seconds each.
+absolute seconds in the full video). The user wants clips of about
+{duration} seconds each.
 
-Score every candidate on four pillars, 0-100 total:
-- Hook: does the opening grab attention in the first 3 seconds?
-- Flow: logical progression with a satisfying ending inside the clip?
-- Value: something worth watching, a quotable line, a revelation, a skill,
-  a funny moment, a strong opinion?
-- Trend: does it match what this audience cares about right now?
+PASS 1 — GENERATE candidates. Find up to 20 self-contained moments that
+could work as standalone vertical clips: the hook must land in the first
+3 seconds and the payoff must happen inside the clip, so a viewer who
+never saw the full stream still understands it. Each candidate should
+start at a SENTENCE START and end at a SENTENCE END (never cut a sentence
+in half). Give each a rough 0-100 quality score (a second pass re-scores
+the best ones properly).
 
 {context_notes}
 
-Return a JSON array (no other text) of up to {num_clips} candidates:
+Return a JSON array (no other text) of up to 20 candidates:
 [{{"title": "short hook title, max 8 words",
    "start_sec": 123.4, "end_sec": 153.4,
    "virality_score": 87,
@@ -348,6 +409,48 @@ fall inside this chunk [{chunk_start} - {chunk_end}]. end_sec - start_sec
 should be close to {duration} seconds. Prefer moments that are
 self-contained. Never invent dialogue that is not in the transcript.
 """
+
+# PASS 2 — SCORE the shortlisted candidates on four pillars, 0-100 total:
+# Hook strength (opening grabs attention in the first 3 seconds),
+# Completeness (a full thought with a satisfying ending inside the clip),
+# Emotion (laugh, shock, awe, anger, inspiration — something felt),
+# Value (something worth watching: a revelation, a skill, a quotable line,
+# a strong opinion). One Gemini call scores the whole shortlist.
+GEMINI_SCORE_PROMPT = """{system}
+
+You are scoring shortlisted clip candidates for a viral short-form video.
+For EACH candidate below, give a 0-100 virality score plus one-line
+reasoning, judged on four pillars:
+- Hook strength: does the opening grab attention in the first 3 seconds?
+- Completeness: a full thought, satisfying ending inside the clip?
+- Emotion: does it make the viewer feel something (laugh, shock, awe)?
+- Value: a revelation, a skill, a quotable line, a strong opinion?
+
+{candidates}
+
+Return a JSON array (no other text), one object per candidate, in the
+same order, with the candidate's index:
+[{{"index": 0, "virality_score": 87,
+   "reason": "one line: why this moment works",
+   "retention_insight": "one line: why viewers stay to the end",
+   "pacing_note": "one line: how the clip is paced"}}]
+Never invent dialogue. Score only what is in the transcript excerpts.
+"""
+
+GEMINI_SCORE_SCHEMA = {
+    "type": "ARRAY",
+    "items": {
+        "type": "OBJECT",
+        "properties": {
+            "index": {"type": "NUMBER"},
+            "virality_score": {"type": "NUMBER"},
+            "reason": {"type": "STRING"},
+            "retention_insight": {"type": "STRING"},
+            "pacing_note": {"type": "STRING"},
+        },
+        "required": ["index", "virality_score", "reason"],
+    },
+}
 
 GEMINI_SCHEMA = {
     "type": "ARRAY",
@@ -407,17 +510,19 @@ def _validate_candidates(raw: Any, chunk: Dict[str, Any],
     return out
 
 
-def score_chunk_with_gemini(client: Any, chunk: Dict[str, Any],
-                            duration: int, num_clips: int,
-                            context_notes: Optional[str]) -> List[Dict[str, Any]]:
-    """Score one transcript chunk with Gemini. JSON validation + 2 retries."""
+def generate_chunk_candidates(client: Any, chunk: Dict[str, Any],
+                              duration: int,
+                              context_notes: Optional[str]
+                              ) -> List[Dict[str, Any]]:
+    """PASS 1 — generate up to 20 candidates from one transcript chunk.
+    JSON validation + 2 retries."""
     from google.genai import types
     notes = (f"Creator notes: {context_notes.strip()}"
              if context_notes and context_notes.strip() else "")
     prompt = GEMINI_PROMPT.format(
         system=GEMINI_SYSTEM,
         chunk_start=fmt_clock(chunk["start"]), chunk_end=fmt_clock(chunk["end"]),
-        num_clips=num_clips, duration=duration, context_notes=notes)
+        duration=duration, context_notes=notes)
     last_error: Optional[Exception] = None
     for attempt in range(3):  # 1 try + 2 retries
         try:
@@ -441,10 +546,76 @@ def score_chunk_with_gemini(client: Any, chunk: Dict[str, Any],
     raise RuntimeError(f"Gemini scoring failed after 3 attempts: {last_error}")
 
 
-def score_with_gemini(chunks: List[Dict[str, Any]], duration: int,
-                      num_clips: int,
-                      context_notes: Optional[str]) -> Tuple[List[Dict[str, Any]], str]:
-    """Score every chunk, merge, dedupe, clamp. Returns (candidates, 'gemini').
+def score_candidates_with_gemini(client: Any, cands: List[Dict[str, Any]],
+                                 words: List[Dict[str, Any]],
+                                 duration: int) -> List[Dict[str, Any]]:
+    """PASS 2 — score the shortlist on hook/completeness/emotion/value.
+
+    One Gemini call scores the whole shortlist. If it fails, the pass-1
+    scores are kept — the job never fails over scoring alone.
+    """
+    from google.genai import types
+    lines = []
+    for i, c in enumerate(cands):
+        excerpt = " ".join(
+            w["w"] for w in words
+            if c["start_sec"] <= w["s"] < c["end_sec"])[:600]
+        lines.append(
+            f"[{i}] {fmt_clock(c['start_sec'])}-{fmt_clock(c['end_sec'])} | "
+            f"{c['title']} | hook: {c['hook']}\n    \"{excerpt}\"")
+    prompt = GEMINI_SCORE_PROMPT.format(
+        system=GEMINI_SYSTEM, candidates="\n".join(lines))
+    for attempt in range(3):  # 1 try + 2 retries
+        try:
+            resp = client.models.generate_content(
+                model=GEMINI_MODEL, contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=GEMINI_SCORE_SCHEMA))
+            scored = json.loads((resp.text or "").strip())
+            if isinstance(scored, list) and scored:
+                by_idx: Dict[int, Dict[str, Any]] = {}
+                for item in scored:
+                    try:
+                        idx = int(item["index"])
+                        score = int(round(float(item["virality_score"])))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if 0 <= idx < len(cands):
+                        by_idx[idx] = {
+                            "virality_score": max(0, min(100, score)),
+                            "reason": str(item.get("reason", ""))[:300],
+                            "retention_insight": str(
+                                item.get("retention_insight", ""))[:300],
+                            "pacing_note": str(
+                                item.get("pacing_note", ""))[:300],
+                        }
+                if by_idx:
+                    out = []
+                    for i, c in enumerate(cands):
+                        c2 = dict(c)
+                        if i in by_idx:
+                            c2.update(by_idx[i])
+                        out.append(c2)
+                    return out
+            prompt += ("\n\nYour previous reply had no usable scores. "
+                       "Return ONLY the JSON array.")
+        except Exception as exc:  # noqa: BLE001 - retry, then keep pass-1
+            prompt += ("\n\nYour previous reply was not valid JSON. "
+                       "Return ONLY the JSON array, nothing else.")
+    log("pass-2 scoring failed; keeping pass-1 scores")
+    return cands
+
+
+def score_with_gemini(chunks: List[Dict[str, Any]],
+                      words: List[Dict[str, Any]], duration: int,
+                      num_clips: int, total_duration: float,
+                      context_notes: Optional[str]
+                      ) -> Tuple[List[Dict[str, Any]], str]:
+    """Two-pass scoring (v2). Pass 1 generates up to 20 candidates per
+    chunk; each is snapped to sentence boundaries; the top 20 are re-scored
+    in one pass-2 call on hook/completeness/emotion/value. Returns
+    (candidates, 'gemini') sorted best-first.
 
     Raises RuntimeError if the key is missing or all chunks fail, so the
     caller can fall back to the deterministic scorer (never silently).
@@ -456,11 +627,25 @@ def score_with_gemini(chunks: List[Dict[str, Any]], duration: int,
     client = genai.Client(api_key=key)
     all_cands: List[Dict[str, Any]] = []
     for i, chunk in enumerate(chunks):
-        log(f"Gemini scoring chunk {i + 1}/{len(chunks)} "
+        log(f"Gemini pass 1: chunk {i + 1}/{len(chunks)} "
             f"({fmt_clock(chunk['start'])}-{fmt_clock(chunk['end'])})")
-        all_cands.extend(score_chunk_with_gemini(client, chunk, duration,
-                                                 num_clips, context_notes))
-    return all_cands, "gemini"
+        all_cands.extend(generate_chunk_candidates(client, chunk, duration,
+                                                   context_notes))
+    snapped: List[Dict[str, Any]] = []
+    for c in all_cands:
+        s, e = snap_to_sentences(words, c["start_sec"], c["end_sec"],
+                                 duration, total_duration)
+        c2 = dict(c)
+        c2["start_sec"], c2["end_sec"] = s, e
+        c2["duration_sec"] = round(e - s, 2)
+        snapped.append(c2)
+    snapped = dedupe_candidates(snapped)
+    snapped.sort(key=lambda c: -c["virality_score"])
+    shortlist = snapped[:SCORE_TOP_CANDIDATES]
+    log(f"Gemini pass 2: scoring {len(shortlist)} shortlisted candidates")
+    scored = score_candidates_with_gemini(client, shortlist, words, duration)
+    scored.sort(key=lambda c: -c["virality_score"])
+    return scored, "gemini"
 
 
 def fallback_score(segments: List[Dict[str, Any]], energy: List[float],
@@ -548,6 +733,57 @@ def clamp_to_duration(cand: Dict[str, Any], duration: int,
     cand["end_sec"] = round(end, 2)
     cand["duration_sec"] = round(end - start, 2)
     return cand
+
+
+def snap_to_sentences(words: List[Dict[str, Any]], start: float, end: float,
+                      target_duration: int,
+                      total_duration: float) -> Tuple[float, float]:
+    """Snap a candidate to sentence boundaries (v2).
+
+    start -> the start of the sentence containing `start` (or the next
+    sentence if `start` falls in a pause). end -> the sentence end nearest
+    to start + target_duration. Sentences end on . ! ? or a >1.5 s pause.
+    Falls back to the original times when no usable sentence exists or the
+    result would be shorter than 5 s. Times stay inside the video.
+    """
+    if not words:
+        return round(start, 2), round(end, 2)
+    spans: List[Tuple[float, float]] = []
+    s0 = float(words[0]["s"])
+    for i, w in enumerate(words):
+        nxt = float(words[i + 1]["s"]) if i + 1 < len(words) else None
+        ends = str(w["w"]).endswith((".", "!", "?")) or (
+            nxt is not None and nxt - float(w["e"]) > 1.5)
+        if ends or i == len(words) - 1:
+            spans.append((s0, float(w["e"])))
+            if nxt is not None:
+                s0 = nxt
+    if not spans:
+        return round(start, 2), round(end, 2)
+    new_start = spans[-1][0]
+    for s, e in spans:
+        if s <= start < e or s > start:
+            new_start = s
+            break
+    target_end = new_start + float(target_duration)
+    ends = sorted(e for s, e in spans if e > new_start + 2.0)
+    new_end = None
+    if ends:
+        # closest sentence end to the target, but keep the clip at least
+        # 3 s long — if the closest end is too short, take the next one
+        best = min(ends, key=lambda e: abs(e - target_end))
+        if best - new_start >= 3.0:
+            new_end = best
+        else:
+            longer = [e for e in ends if e - new_start >= 3.0]
+            new_end = min(longer) if longer else None
+    if new_end is None:
+        new_end = end
+    new_end = min(new_end, total_duration)
+    new_start = max(0.0, new_start)
+    if new_end - new_start < 3.0:
+        return round(start, 2), round(end, 2)
+    return round(new_start, 2), round(new_end, 2)
 
 # ------------------------------------------------- facecam + layout ---
 
@@ -932,19 +1168,25 @@ def _phrases(words: List[Dict[str, Any]], size: int = 3) -> List[List[Dict[str, 
 
 
 def write_ass(words: List[Dict[str, Any]], duration: float,
-              out_path: Path) -> Path:
+              out_path: Path, style: str = "karaoke") -> Path:
     """Word-by-word karaoke .ass: one event per word; the spoken word is
-    coloured yellow and slightly larger, the rest of the phrase stays white.
+    highlighted (colour + larger), the rest of the phrase stays in the
+    style's fill colour. The ASS style is Bold (Bold=-1 in ASS_STYLE).
 
     Words are in CLIP time (0 = first frame). Alignment 2 (bottom-centre)
     with a 560 px bottom margin puts the captions in the gameplay area,
     clear of the platform UI that covers the bottom ~20% of a 9:16 frame.
+    Caption styles (v2): karaoke / bold-white / pop.
     """
-    fill = _ass_colour(CAP_FILL)
-    active = _ass_colour(CAP_ACTIVE)
+    st = CAPTION_STYLES.get(style) or CAPTION_STYLES["karaoke"]
+    fill = _ass_colour(st["fill"])
+    active = _ass_colour(st["active"])
+    size = int(st["size"])
+    active_size = int(st["active_size"])
     header = ASS_STYLE.format(w=OUT_W, h=OUT_H, font=CAP_FONT,
-                              size=CAP_FONT_SIZE, fill=fill,
-                              outline=3, margin_v=CAPTION_MARGIN_BOTTOM)
+                              size=size, fill=fill,
+                              outline=int(st["outline"]),
+                              margin_v=CAPTION_MARGIN_BOTTOM)
     events: List[str] = []
     for phrase in _phrases(words):
         p_start = phrase[0]["s"]
@@ -953,8 +1195,8 @@ def write_ass(words: List[Dict[str, Any]], duration: float,
             parts = []
             for j, tw in enumerate(text_words):
                 if j == idx:
-                    parts.append(f"{{\\c{active}\\fs{CAP_ACTIVE_SIZE}}}{tw}"
-                                 f"{{\\c{fill}\\fs{CAP_FONT_SIZE}}}")
+                    parts.append(f"{{\\c{active}\\fs{active_size}}}{tw}"
+                                 f"{{\\c{fill}\\fs{size}}}")
                 else:
                     parts.append(tw)
             events.append(
@@ -1012,23 +1254,32 @@ def render_title_png(title: str, out_path: Path,
     return out_path, height
 
 
+def video_encoder_args() -> List[str]:
+    """GPU encoder when a GPU is present (NVENC on the Colab T4), else
+    CPU libx264. Same visual quality target (CQ/CRF 19)."""
+    if has_gpu():
+        return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "19"]
+    return ["-c:v", "libx264", "-preset", "fast", "-crf", "19"]
+
+
 # ------------------------------------------------------- segment + render ---
 
 def download_segment(url: str, start: float, end: float,
                      out_path: Path, platform: str) -> Path:
     """Download ONLY the chosen segment at <=1080p.
 
-    Direct .mp4 links (incl. Frame.io direct links) are cut with ffmpeg over
-    HTTP (fast seek). Everything else uses yt-dlp --download-sections.
+    Direct .mp4 links (incl. Frame.io direct links) and uploaded files
+    are cut with ffmpeg (fast seek). Everything else uses yt-dlp
+    --download-sections.
     """
-    if platform in ("direct-mp4", "frameio"):
+    if platform in ("direct-mp4", "frameio", "upload"):
         run(["ffmpeg", "-y", "-v", "error", "-ss", f"{start:.3f}",
              "-i", url, "-t", f"{end - start:.3f}",
              "-c", "copy", "-movflags", "+faststart", str(out_path)],
             "ffmpeg direct-mp4 segment cut")
         return out_path
     run(["yt-dlp", "--no-playlist",
-         "--extractor-args", "youtube:player_client=android",
+         "--extractor-args", "youtube:player_client=android"] + cookies_args() + [
          "--download-sections",
          f"*{fmt_hms(start)}-{fmt_hms(end)}",
          "-f", "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]",
@@ -1037,19 +1288,120 @@ def download_segment(url: str, start: float, end: float,
     return out_path
 
 
+def _removed_intervals(words: List[Dict[str, Any]],
+                       clip_duration: float) -> List[Tuple[float, float]]:
+    """Intervals to cut from a clip (clip-local times): silences longer
+    than SILENCE_CUT_SECONDS (keeping SILENCE_KEEP_SECONDS at each end)
+    plus filler words (um/uh/...). Returns merged, sorted intervals."""
+    removed: List[Tuple[float, float]] = []
+    for a, b in zip(words, words[1:]):
+        gap = float(b["s"]) - float(a["e"])
+        if gap > SILENCE_CUT_SECONDS:
+            rs = float(a["e"]) + SILENCE_KEEP_SECONDS
+            re = float(b["s"]) - SILENCE_KEEP_SECONDS
+            if re - rs > 0.05:
+                removed.append((rs, re))
+    for i, w in enumerate(words):
+        if str(w["w"]).strip(".,!?;:").lower() not in FILLER_WORDS:
+            continue
+        prev_e = float(words[i - 1]["e"]) if i > 0 else 0.0
+        next_s = float(words[i + 1]["s"]) if i + 1 < len(words) else clip_duration
+        rs = max(float(w["s"]) - 0.05, prev_e + 0.02)
+        re = min(float(w["e"]) + 0.05, next_s - 0.02)
+        if re - rs > 0.02:
+            removed.append((rs, re))
+    removed.sort()
+    merged: List[List[float]] = []
+    for rs, re in removed:
+        if merged and rs - merged[-1][1] < 0.05:
+            merged[-1][1] = max(merged[-1][1], re)
+        else:
+            merged.append([rs, re])
+    return [(rs, re) for rs, re in merged
+            if 0.0 <= rs < re <= clip_duration]
+
+
+def apply_jump_cuts(source: Path, words: List[Dict[str, Any]],
+                    out_path: Path, clip_duration: float
+                    ) -> Optional[Tuple[Path, List[Dict[str, Any]], float]]:
+    """Cut silences + filler words out of a clip-local segment (v2).
+
+    One ffmpeg call cuts the keep-ranges and concats them (video+audio).
+    Word timestamps are remapped onto the cut file so captions stay in
+    sync. Returns (cut_path, remapped_words, new_duration), or None when
+    there is nothing worth cutting (too little removed, or the keep would
+    drop below half the clip).
+    """
+    if not words or len(words) < 3:
+        return None
+    removed = _removed_intervals(words, clip_duration)
+    total_removed = sum(re - rs for rs, re in removed)
+    if total_removed < 0.3:
+        return None
+    keep: List[Tuple[float, float]] = []
+    cur = 0.0
+    for rs, re in removed:
+        if rs > cur:
+            keep.append((cur, rs))
+        cur = max(cur, re)
+    if cur < clip_duration:
+        keep.append((cur, clip_duration))
+    keep = [(s, e) for s, e in keep if e - s > 0.05]
+    if not keep or sum(e - s for s, e in keep) < clip_duration * 0.5:
+        return None
+    # one ffmpeg call: each keep-range as an input, concat filter joins them
+    cmd: List[str] = ["ffmpeg", "-y", "-v", "error"]
+    for s, e in keep:
+        cmd += ["-ss", f"{s:.3f}", "-t", f"{e - s:.3f}", "-i", str(source)]
+    filt = "".join(f"[{i}:v][{i}:a]" for i in range(len(keep)))
+    filt += f"concat=n={len(keep)}:v=1:a=1[v][a]"
+    cmd += ["-filter_complex", filt, "-map", "[v]", "-map", "[a]"]
+    cmd += video_encoder_args()
+    cmd += ["-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+            str(out_path)]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    if res.returncode != 0 or not out_path.exists():
+        log(f"jump cuts failed, keeping uncut segment: "
+            f"{(res.stderr or '')[-300:]}")
+        return None
+
+    def _shift(t: float) -> float:
+        return t - sum(re - rs for rs, re in removed if re <= t)
+
+    remapped: List[Dict[str, Any]] = []
+    for w in words:
+        if str(w["w"]).strip(".,!?;:").lower() in FILLER_WORDS:
+            continue  # filler words are cut out entirely
+        remapped.append({"w": w["w"],
+                         "s": round(_shift(float(w["s"])), 3),
+                         "e": round(_shift(float(w["e"])), 3)})
+    new_duration = round(clip_duration - total_removed, 3)
+    log(f"jump cuts: removed {total_removed:.1f}s "
+        f"({len(removed)} cuts), {clip_duration:.1f}s -> {new_duration:.1f}s")
+    return out_path, remapped, new_duration
+
+
 def render_clip(source: Path, clip: Dict[str, Any], layout: str,
                 cam: Optional[Tuple[float, float, float, float]],
                 track: Optional[Dict[str, Any]], info: Dict[str, Any],
-                words: List[Dict[str, Any]], out_path: Path) -> Path:
+                words: List[Dict[str, Any]], out_path: Path,
+                caption_style: str = "karaoke",
+                music_path: Optional[Path] = None) -> Path:
     """Render ONE clip in a SINGLE ffmpeg pass.
 
     The Gemini roadmap's crop re-encoded every frame in Python (mp4v) and
     then again in ffmpeg: slow and lossy. Here the crop path is computed
     first (facecam detection above) and ffmpeg does one pass:
-    layout graph -> .ass caption burn-in -> title bar on the seam ->
-    libx264 CRF 19 + AAC, loudnorm -14 LUFS.
+    layout graph -> subtle punch-in zoom -> .ass caption burn-in ->
+    title bar on the seam -> GPU encoder when available (NVENC on the
+    Colab T4, else libx264) + AAC, loudnorm -14 LUFS.
+
+    TIMELINE (fixed 2026-11-20): `source` is the segment file, already cut
+    to [clip_start, clip_end], so everything here is SEGMENT-LOCAL (0 =
+    first frame). The old code sought to clip["start_sec"] inside the
+    segment — past EOF for any clip not starting at 0 — so no clip could
+    ever render. The seek is gone; the crop branch samples/detects from 0.
     """
-    start = float(clip["start_sec"])
     duration = float(clip["duration_sec"])
     clip_dir = out_path.parent
     clip_dir.mkdir(parents=True, exist_ok=True)
@@ -1057,15 +1409,16 @@ def render_clip(source: Path, clip: Dict[str, Any], layout: str,
     if layout == "stack" and cam is not None:
         graph, seam = stack_filtergraph(info, cam)
     elif layout == "crop" and track is not None:
-        frames, scale = sample_frames(source, start, duration, info)
-        scenes = detect_scenes(source, start, start + duration)
+        frames, scale = sample_frames(source, 0.0, duration, info)
+        scenes = detect_scenes(source, 0.0, duration)
         graph, seam = crop_filtergraph(info, track, len(frames), scale,
-                                       scenes, start)
+                                       scenes, 0.0)
     else:
         graph, seam = blur_filtergraph(info)
         layout = "blur"
 
-    ass_path = write_ass(words, duration, clip_dir / f"{out_path.stem}.ass")
+    ass_path = write_ass(words, duration, clip_dir / f"{out_path.stem}.ass",
+                         style=caption_style)
     title_png, title_h = render_title_png(clip["title"],
                                           clip_dir / f"{out_path.stem}.title.png")
     if seam is not None:
@@ -1074,16 +1427,33 @@ def render_clip(source: Path, clip: Dict[str, Any], layout: str,
         title_y = int(OUT_H * 0.07)
     # the .ass path is relative to the clip dir (ffmpeg runs there, so no
     # escaping problems with special characters in the path)
-    chain = (f"{graph};[framed]ass={ass_path.name}[subbed];"
+    # zoompan: a subtle punch-in (1.00 -> 1.04) with a 4 s period, applied
+    # BEFORE the captions so the text stays stable on screen. fps is set
+    # to the source frame rate: zoompan defaults to 25 fps, which would
+    # re-time the clip (a 5 s clip at 30 fps came out 6 s long).
+    fps = float(info.get("fps") or 30.0)
+    chain = (f"{graph};[framed]zoompan=z='1+0.04*sin(2*PI*time/4)':"
+             f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:"
+             f"s={OUT_W}x{OUT_H}:fps={fps:.2f}[zoomed];"
+             f"[zoomed]ass={ass_path.name}[subbed];"
              f"[subbed][1:v]overlay=(W-w)/2:{title_y}[titled]")
-    cmd = ["ffmpeg", "-y", "-v", "error", "-ss", f"{start:.3f}",
-           "-t", f"{duration:.3f}", "-i", str(source), "-i", str(title_png),
-           "-filter_complex", chain,
-           "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
-           "-map", "[titled]", "-map", "0:a?",
-           "-c:v", "libx264", "-preset", "fast", "-crf", "19",
-           "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
-           str(out_path)]
+    cmd = ["ffmpeg", "-y", "-v", "error",
+           "-t", f"{duration:.3f}", "-i", str(source), "-i", str(title_png)]
+    if music_path is not None and music_path.exists():
+        cmd += ["-stream_loop", "-1", "-i", str(music_path)]
+        chain += (";[0:a]loudnorm=I=-14:TP=-1.5:LRA=11[voice];"
+                  "[2:a]volume=0.25[bgm];"
+                  "[bgm][voice]sidechaincompress=threshold=0.05:ratio=6:"
+                  "attack=200:release=1000[ducked];"
+                  "[voice][ducked]amix=inputs=2:duration=first[aout]")
+        cmd += ["-filter_complex", chain, "-map", "[titled]", "-map", "[aout]"]
+    else:
+        cmd += ["-filter_complex", chain,
+                "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
+                "-map", "[titled]", "-map", "0:a?"]
+    cmd += video_encoder_args()
+    cmd += ["-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+            str(out_path)]
     res = subprocess.run(cmd, capture_output=True, text=True,
                          cwd=str(clip_dir), timeout=3600)
     if res.returncode != 0:
@@ -1139,13 +1509,21 @@ def load_ckpt(job_id: str, name: str) -> Optional[Any]:
 
 
 def new_job(url: str, clip_duration: int, num_clips: int, mode: str,
-            context_notes: Optional[str]) -> Dict[str, Any]:
+            context_notes: Optional[str],
+            range_start: float = 0.0,
+            range_end: Optional[float] = None,
+            caption_style: str = "karaoke",
+            music_url: Optional[str] = None,
+            platform_override: Optional[str] = None) -> Dict[str, Any]:
     job_id = uuid.uuid4().hex[:8]
     job: Dict[str, Any] = {
         "id": job_id, "status": "queued", "progress": 0,
-        "source_url": url, "platform": detect_platform(url),
+        "source_url": url,
+        "platform": platform_override or detect_platform(url),
         "target_duration": clip_duration, "num_clips": num_clips,
         "mode": mode, "created_at": datetime.utcnow().isoformat(),
+        "range_start": range_start, "range_end": range_end,
+        "caption_style": caption_style, "music_url": music_url,
         "steps": [{"id": s, "title": t, "detail": d, "status": "pending"}
                   for s, t, d in STEP_DEFS],
         "clips": [], "scoring": None, "error": None,
@@ -1180,6 +1558,53 @@ def _clip_words(segments: List[Dict[str, Any]], start: float,
     return out
 
 
+def choose_layout(seg_path: Path, duration_sec: float,
+                  info: Dict[str, Any], memory: Dict[str, Any]
+                  ) -> Tuple[str, Optional[Tuple[float, float, float, float]],
+                             Optional[Dict[str, Any]], str]:
+    """Pick the 9:16 layout for one clip: facecam stack, talking-head crop,
+    or blurred-background fallback. Returns (layout, cam, track, cam_how)."""
+    cam, cam_how = detect_facecam(seg_path, 0.0, duration_sec, info, memory)
+    if cam is not None:
+        return "stack", cam, None, cam_how
+    frames, scale = sample_frames(seg_path, 0.0, duration_sec, info)
+    tracks = group_tracks(detect_faces(frames), frames)
+    live = [t for t in tracks if t["alive"] and t["presence"] >= 0.5]
+    big = [t for t in live if t["size"] >= 0.13]
+    if len(big) == 1:
+        return "crop", None, big[0], "fallback: no facecam"
+    return "blur", None, None, "fallback: no facecam"
+
+
+def download_music(url: str, out_dir: Path) -> Optional[Path]:
+    """Fetch an optional BGM track (direct audio link, else yt-dlp audio).
+    Returns the path or None — music is optional and never fails the job."""
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        low = url.lower()
+        if low.endswith((".mp3", ".m4a", ".wav", ".ogg", ".opus", ".flac")) \
+                or ".mp3?" in low or ".m4a?" in low:
+            import urllib.request
+            suffix = Path(low.split("?")[0]).suffix or ".mp3"
+            dest = out_dir / ("music" + suffix)
+            urllib.request.urlretrieve(url, dest)
+        else:
+            dest_tpl = str(out_dir / "music.%(ext)s")
+            run(["yt-dlp", "--no-playlist", "-f", "bestaudio/best",
+                 "-o", dest_tpl, url] + cookies_args(), "yt-dlp music download")
+            dest = next((p for p in out_dir.glob("music.*")
+                         if p.suffix.lower() in (".m4a", ".opus", ".webm",
+                                                 ".mp3", ".ogg", ".wav",
+                                                 ".aac")), None)
+            if dest is None:
+                return None
+        if dest.exists() and dest.stat().st_size > 1000:
+            return dest
+    except Exception as exc:  # noqa: BLE001 - music is optional
+        log(f"music download failed, continuing without BGM ({exc})")
+    return None
+
+
 def run_job(job: Dict[str, Any]) -> None:
     """Full pipeline for one job, with Drive checkpoints at every stage so a
     dead session resumes instead of restarting."""
@@ -1201,6 +1626,9 @@ def run_job(job: Dict[str, Any]) -> None:
                 "browser inspector <video src>) and paste THAT link instead.")
 
         # --- stage 1+2: audio + transcript (resumable from checkpoint) ----
+        range_start = float(job.get("range_start") or 0.0)
+        range_end = job.get("range_end")
+        range_end = float(range_end) if range_end is not None else None
         segments = load_ckpt(job_id, "transcript.json")
         meta = load_ckpt(job_id, "meta.json")
         total_duration: float
@@ -1215,16 +1643,30 @@ def run_job(job: Dict[str, Any]) -> None:
                      "Resumed from Drive checkpoint")
         else:
             set_step(job, "download", "active")
-            wav = download_audio(url, work)
+            wav = download_audio(url, work, job["platform"],
+                                 range_start, range_end)
             set_step(job, "download", "completed")
             set_step(job, "transcribe", "active")
-            segments, language, total_duration = transcribe_audio(wav)
+            segments, language, audio_len = transcribe_audio(wav)
             energy = audio_energy_per_second(wav)
+            if range_start > 0:
+                # the WAV starts at the range start: put every timestamp
+                # back onto the original video timeline, and pad the
+                # per-second energy so it stays indexed by absolute second
+                for seg in segments:
+                    seg["start"] = float(seg["start"]) + range_start
+                    seg["end"] = float(seg["end"]) + range_start
+                    for w in seg["words"]:
+                        w["s"] = float(w["s"]) + range_start
+                        w["e"] = float(w["e"]) + range_start
+                energy = [0.0] * int(range_start) + energy
+            total_duration = range_start + float(audio_len)
             save_ckpt(job_id, "transcript.json", segments)
             save_ckpt(job_id, "meta.json", {
                 "language": language, "total_duration": total_duration,
                 "energy_per_second": energy,
-                "source_url": url, "platform": job["platform"]})
+                "source_url": url, "platform": job["platform"],
+                "range_start": range_start, "range_end": range_end})
             set_step(job, "transcribe", "completed",
                      f"{len(segments)} segments, {language}, "
                      f"{fmt_clock(total_duration)} total")
@@ -1240,22 +1682,45 @@ def run_job(job: Dict[str, Any]) -> None:
         else:
             set_step(job, "virality", "active")
             chunks = chunk_transcript(segments)
+            words_all = [w for seg in segments for w in seg["words"]]
             if not energy:
                 # only when resuming a very old checkpoint without energy
                 energy = [0.0] * max(1, int(total_duration))
             try:
                 if job["mode"] == "fallback":
                     raise RuntimeError("fallback mode requested")
-                ranked, scoring = score_with_gemini(chunks, duration,
-                                                    num_clips,
-                                                    job.get("context_notes"))
+                ranked, scoring = score_with_gemini(
+                    chunks, words_all, duration, num_clips, total_duration,
+                    job.get("context_notes"))
             except Exception as exc:  # noqa: BLE001 - deterministic fallback
                 log(f"Gemini scoring unavailable ({exc}); using fallback scorer")
                 ranked, scoring = fallback_score(segments, energy, duration,
                                                  num_clips)
+                # snap fallback windows to sentence boundaries too
+                snapped_fb: List[Dict[str, Any]] = []
+                for c in ranked:
+                    s, e = snap_to_sentences(words_all, c["start_sec"],
+                                             c["end_sec"], duration,
+                                             total_duration)
+                    c2 = dict(c)
+                    c2["start_sec"], c2["end_sec"] = s, e
+                    c2["duration_sec"] = round(e - s, 2)
+                    snapped_fb.append(c2)
+                ranked = snapped_fb
             ranked = dedupe_candidates(ranked)
-            ranked = [clamp_to_duration(c, duration, total_duration)
-                      for c in ranked][:num_clips]
+            # v2: durations are approximate (sentence ends win over exact
+            # length), so only enforce the video bounds, never an exact
+            # duration — clamp_to_duration is kept for reference only
+            bounded: List[Dict[str, Any]] = []
+            for c in ranked:
+                s = max(0.0, float(c["start_sec"]))
+                e = min(float(c["end_sec"]), total_duration)
+                if e - s >= 5.0:
+                    c2 = dict(c)
+                    c2["start_sec"], c2["end_sec"] = round(s, 2), round(e, 2)
+                    c2["duration_sec"] = round(e - s, 2)
+                    bounded.append(c2)
+            ranked = bounded[:num_clips]
             for cand in ranked:
                 cand["scoring"] = scoring
             save_ckpt(job_id, "ranking.json", ranked)
@@ -1269,6 +1734,13 @@ def run_job(job: Dict[str, Any]) -> None:
         set_step(job, "reframe", "active")
         set_step(job, "caption", "active")
         memory = CAM_MEMORY.setdefault(job_id, {})
+        # optional BGM, downloaded once per job (never fails the job)
+        music_path = None
+        if job.get("music_url"):
+            music_path = download_music(str(job["music_url"]), work)
+        caption_style = job.get("caption_style") or "karaoke"
+        if caption_style not in CAPTION_STYLES:
+            caption_style = "karaoke"
         done_ids = {c["id"] for c in job["clips"]}
         for idx, cand in enumerate(ranked):
             clip_id = f"clip-{idx + 1:02d}"
@@ -1280,27 +1752,22 @@ def run_job(job: Dict[str, Any]) -> None:
                 download_segment(url, cand["start_sec"], cand["end_sec"],
                                  seg_path, job["platform"])
             info = probe_info(seg_path)
-            cam, cam_how = detect_facecam(seg_path, 0.0,
-                                          cand["duration_sec"], info, memory)
-            # talking-head fallback needs the face track, not the cam box
-            track = None
-            layout = "stack"
-            if cam is not None:
-                layout = "stack"
-            else:
-                frames, scale = sample_frames(seg_path, 0.0,
-                                              cand["duration_sec"], info)
-                tracks = group_tracks(detect_faces(frames), frames)
-                live = [t for t in tracks if t["alive"] and t["presence"] >= 0.5]
-                big = [t for t in live if t["size"] >= 0.13]
-                if len(big) == 1:
-                    layout, track = "crop", big[0]
-                else:
-                    layout = "blur"
+            layout, cam, track, cam_how = choose_layout(
+                seg_path, cand["duration_sec"], info, memory)
             words = _clip_words(segments, cand["start_sec"], cand["end_sec"])
+            # jump cuts (v2): silences + fillers out, captions remapped
+            render_source = seg_path
+            cut_path = work / f"{clip_id}_cut.mp4"
+            cut = apply_jump_cuts(seg_path, words, cut_path,
+                                  cand["duration_sec"])
+            if cut is not None:
+                render_source, words, new_dur = cut
+                cand = dict(cand)
+                cand["duration_sec"] = new_dur
             out_path = work / f"{clip_id}.mp4"
-            render_clip(seg_path, cand, layout, cam, track, info, words,
-                        out_path)
+            render_clip(render_source, cand, layout, cam, track, info, words,
+                        out_path, caption_style=caption_style,
+                        music_path=music_path)
             shutil.copy2(out_path, drive_mp4)
             clip_record = {
                 "id": clip_id,
@@ -1310,12 +1777,15 @@ def run_job(job: Dict[str, Any]) -> None:
                 "end_time_sec": cand["end_sec"],
                 "duration_sec": cand["duration_sec"],
                 "transcript": " ".join(w["w"] for w in words),
+                "words": [{"w": w["w"], "start": w["s"], "end": w["e"]}
+                          for w in words],
                 "hook_reasoning": cand.get("reason", ""),
                 "retention_insight": cand.get("retention_insight", ""),
                 "pacing_note": cand.get("pacing_note", ""),
                 "video_path": f"/api/download/{job_id}/{clip_id}",
                 "layout": layout,
-                "facecam": cam_how if cam is not None else "fallback: no facecam",
+                "facecam": cam_how,
+                "caption_style": caption_style,
                 "scoring": scoring,
                 "source_type": "colab",
             }
@@ -1323,6 +1793,7 @@ def run_job(job: Dict[str, Any]) -> None:
             job["clips"].append(clip_record)
             save_ckpt(job_id, "clips.json", job["clips"])
             seg_path.unlink(missing_ok=True)
+            cut_path.unlink(missing_ok=True)
             log(f"job {job_id}: {clip_id} done "
                 f"({cand['title'][:40]}... layout={layout})")
         set_step(job, "reframe", "completed")
@@ -1345,9 +1816,13 @@ class ProcessUrlRequest(BaseModel):
     num_clips: int = 5            # 1-20
     mode: str = "gemini"          # "gemini" or "fallback"
     context_notes: Optional[str] = None
+    start_sec: float = 0.0        # v2: time range — only this part is
+    end_sec: Optional[float] = None  # clipped (24 h streams: pick a slice)
+    caption_style: str = "karaoke"   # v2: karaoke / bold-white / pop
+    music_url: Optional[str] = None  # v2: optional BGM link (ducked)
 
 
-app = FastAPI(title="SnapReel Studio Colab Backend", version="2.0.0")
+app = FastAPI(title="SnapReel Studio Colab Backend", version="2.2.0")
 
 # CORS: the SnapReel Studio web app (Google AI Studio origin) calls this
 # server cross-origin from the browser. Without these headers the browser
@@ -1370,7 +1845,8 @@ def health() -> Dict[str, Any]:
             "service": "SnapReel Studio Colab Backend",
             "gpu": has_gpu(),
             "drive_mounted": DRIVE_ROOT.exists(),
-            "gemini_key_set": bool(get_gemini_key())}
+            "gemini_key_set": bool(get_gemini_key()),
+            "cookies_present": COOKIES_FILE.exists()}
 
 
 @app.post("/api/process-url", status_code=202)
@@ -1381,10 +1857,149 @@ def process_url(req: ProcessUrlRequest) -> Dict[str, Any]:
     duration = max(10, min(180, int(req.clip_duration)))
     num_clips = max(1, min(20, int(req.num_clips)))
     mode = req.mode if req.mode in ("gemini", "fallback") else "gemini"
-    job = new_job(url, duration, num_clips, mode, req.context_notes)
+    start_sec = max(0.0, float(req.start_sec or 0.0))
+    end_sec = float(req.end_sec) if req.end_sec is not None else None
+    if end_sec is not None and end_sec <= start_sec:
+        raise HTTPException(400, "end_sec must be after start_sec.")
+    caption_style = req.caption_style if req.caption_style in CAPTION_STYLES \
+        else "karaoke"
+    music_url = (req.music_url or "").strip() or None
+    job = new_job(url, duration, num_clips, mode, req.context_notes,
+                  range_start=start_sec, range_end=end_sec,
+                  caption_style=caption_style, music_url=music_url)
     EXECUTOR.submit(run_job, job)
     return {"jobId": job["id"], "status": job["status"],
             "platform": job["platform"]}
+
+
+@app.post("/api/upload-video", status_code=202)
+async def upload_video(file: UploadFile = File(...),
+                       clip_duration: int = Form(30),
+                       num_clips: int = Form(5),
+                       mode: str = Form("gemini"),
+                       start_sec: float = Form(0.0),
+                       end_sec: Optional[float] = Form(None),
+                       caption_style: str = Form("karaoke"),
+                       music_url: Optional[str] = Form(None),
+                       context_notes: Optional[str] = Form(None)
+                       ) -> Dict[str, Any]:
+    """Upload a video file (up to 2 GB) and clip it like a URL job (v2)."""
+    ext = Path(file.filename or "video.mp4").suffix.lower() or ".mp4"
+    if ext not in (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".ts"):
+        raise HTTPException(400, f"Unsupported video type: {ext}")
+    duration = max(10, min(180, int(clip_duration)))
+    num_clips = max(1, min(20, int(num_clips)))
+    mode = mode if mode in ("gemini", "fallback") else "gemini"
+    start_sec = max(0.0, float(start_sec))
+    end_sec = float(end_sec) if end_sec is not None else None
+    if end_sec is not None and end_sec <= start_sec:
+        raise HTTPException(400, "end_sec must be after start_sec.")
+    if caption_style not in CAPTION_STYLES:
+        caption_style = "karaoke"
+    music_url = (music_url or "").strip() or None
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = WORK_DIR / f"upload_{uuid.uuid4().hex[:8]}{ext}"
+    size = 0
+    with tmp.open("wb") as f:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > 2 * 1024 * 1024 * 1024:
+                tmp.unlink(missing_ok=True)
+                raise HTTPException(413, "Upload is over the 2 GB limit.")
+            f.write(chunk)
+    if size < 1000:
+        tmp.unlink(missing_ok=True)
+        raise HTTPException(400, "Uploaded file is empty.")
+    job = new_job(str(tmp), duration, num_clips, mode, context_notes,
+                  range_start=start_sec, range_end=end_sec,
+                  caption_style=caption_style, music_url=music_url,
+                  platform_override="upload")
+    EXECUTOR.submit(run_job, job)
+    return {"jobId": job["id"], "status": job["status"],
+            "platform": "upload"}
+
+
+class RetrimRequest(BaseModel):
+    job_id: str
+    clip_id: str
+    start_sec: float
+    end_sec: float
+    caption_style: str = "karaoke"
+
+
+@app.post("/api/retrim")
+def retrim_clip(req: RetrimRequest) -> Dict[str, Any]:
+    """Re-render one clip with a new start/end + caption style (v2).
+
+    Re-downloads the segment for the new range from the job's original
+    source, re-detects the layout, re-renders, and replaces the clip
+    record (same clip_id, new file). Works after a server restart: the
+    source URL + transcript come from the Drive checkpoints.
+    """
+    job_id = (req.job_id or "").strip()
+    clip_id = (req.clip_id or "").strip()
+    meta = load_ckpt(job_id, "meta.json")
+    segments = load_ckpt(job_id, "transcript.json")
+    clips = load_ckpt(job_id, "clips.json") or []
+    if not meta or not segments:
+        raise HTTPException(404, "Job not found (no Drive checkpoint).")
+    old = next((c for c in clips if c["id"] == clip_id), None)
+    if old is None:
+        raise HTTPException(404, "Clip not found.")
+    total = float(meta.get("total_duration") or 0.0)
+    start = max(0.0, float(req.start_sec))
+    end = float(req.end_sec)
+    if total and end > total:
+        end = total
+    if end - start < 5.0:
+        raise HTTPException(400, "New range must be at least 5 seconds.")
+    style = req.caption_style if req.caption_style in CAPTION_STYLES \
+        else "karaoke"
+    url = str(meta["source_url"])
+    platform = str(meta.get("platform") or detect_platform(url))
+    work = job_dir(job_id)
+    work.mkdir(parents=True, exist_ok=True)
+    seg_path = work / f"{clip_id}_retrim_source.mp4"
+    download_segment(url, start, end, seg_path, platform)
+    info = probe_info(seg_path)
+    memory = CAM_MEMORY.setdefault(job_id, {})
+    layout, cam, track, cam_how = choose_layout(seg_path, end - start, info,
+                                                memory)
+    words = _clip_words(segments, start, end)
+    render_source = seg_path
+    cut_path = work / f"{clip_id}_retrim_cut.mp4"
+    cut = apply_jump_cuts(seg_path, words, cut_path, end - start)
+    new_dur = end - start
+    if cut is not None:
+        render_source, words, new_dur = cut
+    cand = {"title": old["title"], "start_sec": start, "end_sec": end,
+            "duration_sec": new_dur}
+    out_path = work / f"{clip_id}.mp4"
+    music_path = next((p for p in work.glob("music.*")), None)
+    render_clip(render_source, cand, layout, cam, track, info, words,
+                out_path, caption_style=style, music_path=music_path)
+    shutil.copy2(out_path, ckpt_dir(job_id) / f"{clip_id}.mp4")
+    record = dict(old)
+    record.update({
+        "start_time_sec": round(start, 2), "end_time_sec": round(end, 2),
+        "duration_sec": round(new_dur, 2),
+        "transcript": " ".join(w["w"] for w in words),
+        "words": [{"w": w["w"], "start": w["s"], "end": w["e"]}
+                  for w in words],
+        "layout": layout, "facecam": cam_how, "caption_style": style,
+    })
+    clips = [record if c["id"] == clip_id else c for c in clips]
+    save_ckpt(job_id, "clips.json", clips)
+    job = JOBS.get(job_id)
+    if job is not None:
+        job["clips"] = [record if c["id"] == clip_id else c
+                        for c in job["clips"]]
+    seg_path.unlink(missing_ok=True)
+    cut_path.unlink(missing_ok=True)
+    return {"jobId": job_id, "clip": record}
 
 
 @app.get("/api/status/{job_id}")
