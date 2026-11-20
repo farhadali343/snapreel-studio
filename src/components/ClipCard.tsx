@@ -1,6 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Captions,
   ChevronDown,
   ChevronUp,
   Download,
@@ -42,7 +41,6 @@ export const ClipCard: React.FC<ClipCardProps> = ({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(true);
-  const [showCaptions, setShowCaptions] = useState(true);
   const [currentTime, setCurrentTime] = useState(0);
   const [isReasoningOpen, setIsReasoningOpen] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
@@ -272,20 +270,6 @@ export const ClipCard: React.FC<ClipCardProps> = ({
     setIsEditing(false);
   };
 
-  const captionChunk = useMemo(() => {
-    if (!clip.words.length) return { tokens: [], activeIndex: -1 };
-    let idx = clip.words.findIndex((w) => currentTime >= w.start && currentTime <= w.end);
-    if (idx === -1) {
-      const lastPassed = clip.words.filter((w) => w.start <= currentTime).length - 1;
-      idx = Math.max(0, lastPassed);
-    }
-    const chunkStart = Math.floor(idx / 3) * 3;
-    return {
-      tokens: clip.words.slice(chunkStart, chunkStart + 3),
-      activeIndex: idx - chunkStart,
-    };
-  }, [clip.words, currentTime]);
-
   const scoreTone =
     clip.viralityScore >= 90
       ? 'text-emerald-700 bg-emerald-50 border-emerald-200'
@@ -334,31 +318,17 @@ export const ClipCard: React.FC<ClipCardProps> = ({
           </div>
         )}
 
-        {/* Measured Gradient Scrim for Legible Controls & Kinetic Captions */}
+        {/* Gradient scrim for legible controls */}
         <div
           aria-hidden="true"
           className="absolute inset-0 bg-gradient-to-t from-slate-950/90 via-slate-950/20 to-slate-950/35 pointer-events-none"
         />
 
         {/* Top Bar Overlay inside 9:16 Frame */}
-        <div className="absolute top-3 inset-x-3 flex items-center justify-between gap-2">
+        <div className="absolute top-3 left-3">
           <span className="font-mono-tabular text-[11px] font-medium text-white/95 bg-slate-950/60 backdrop-blur-sm px-2.5 py-1 rounded-md">
             9:16 · 1080×1920
           </span>
-
-          <button
-            type="button"
-            onClick={() => setShowCaptions((prev) => !prev)}
-            aria-pressed={showCaptions}
-            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold transition-colors cursor-pointer ${
-              showCaptions
-                ? 'bg-indigo-600 text-white'
-                : 'bg-slate-950/60 text-slate-200 hover:bg-slate-950/80'
-            }`}
-          >
-            <Captions className="w-3.5 h-3.5" aria-hidden="true" />
-            {showCaptions ? 'Captions On' : 'Captions Off'}
-          </button>
         </div>
 
         {/* Center Play Trigger */}
@@ -380,27 +350,6 @@ export const ClipCard: React.FC<ClipCardProps> = ({
             )}
           </span>
         </button>
-
-        {/* Bold Kinetic Word-Highlight Captions Preview with Indigo Accent */}
-        {showCaptions && captionChunk.tokens.length > 0 && (
-          <div className="absolute inset-x-4 bottom-16 flex flex-wrap items-center justify-center gap-x-2 gap-y-1.5 pointer-events-none">
-            {captionChunk.tokens.map((token, idx) => {
-              const isCurrent = idx === captionChunk.activeIndex;
-              return (
-                <span
-                  key={`${token.word}-${idx}`}
-                  className={`font-display text-lg sm:text-xl font-extrabold uppercase tracking-tight px-2 py-0.5 rounded-md transition-transform duration-100 ${
-                    isCurrent
-                      ? 'bg-indigo-600 text-white scale-105 shadow-md'
-                      : 'text-white drop-shadow-[0_2px_4px_rgba(0,0,0,0.95)]'
-                  }`}
-                >
-                  {token.word}
-                </span>
-              );
-            })}
-          </div>
-        )}
 
         {/* Player Scrubber Controls */}
         <div
