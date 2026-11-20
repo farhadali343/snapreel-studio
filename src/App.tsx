@@ -1,6 +1,20 @@
 import { useEffect, useRef, useState } from 'react';
-import type { ClipJob, GeneratedClip, TargetDuration } from './types/clip';
-import { detectVideoPlatform, normalizeBackendUrl, backendHeaders, DEFAULT_BACKEND_URL } from './lib/clipHelpers';
+import type {
+  CaptionStyleId,
+  ClipJob,
+  GeneratedClip,
+  PipelineStep,
+  StepState,
+  TargetDuration,
+  VideoPlatform,
+} from './types/clip';
+import {
+  detectVideoPlatform,
+  normalizeBackendUrl,
+  backendHeaders,
+  DEFAULT_BACKEND_URL,
+  parseTimeToSeconds,
+} from './lib/clipHelpers';
 import { Navbar } from './components/Navbar';
 import { HeroInput, type ConnectionStatus } from './components/HeroInput';
 import { PipelineTracker } from './components/PipelineTracker';
@@ -8,6 +22,108 @@ import { ResultsDashboard } from './components/ResultsDashboard';
 import { BackendSetupSection } from './components/BackendSetupSection';
 
 const COLAB_STORAGE_KEY = 'snapreel_colab_backend_url';
+
+// --- Backend -> frontend shape mapping (v2) ----------------------------
+// The Colab backend speaks snake_case (virality_score, start_time_sec,
+// steps as {id, title, detail, status}, job "id"/"progress"/"error") while
+// the UI speaks camelCase (viralityScore, startTimeSec, steps as
+// {key, label, toolTag, detail, state}, jobId/progressPercent). The old
+// code passed the backend payload straight through, so the first real
+// clip would have rendered an empty score, blank steps and broken
+// download links. Everything from /api/status and /api/retrim goes
+// through these two functions.
+const STEP_MAP: Record<string, { key: PipelineStep['key']; label: string; toolTag: string }> = {
+  download: { key: 'downloading', label: 'Downloading Stream', toolTag: 'yt-dlp' },
+  transcribe: { key: 'transcribing', label: 'Transcribing Audio', toolTag: 'Whisper' },
+  virality: { key: 'scoring', label: 'AI Virality Scoring', toolTag: 'Virality Scorer' },
+  reframe: { key: 'cropping', label: 'Active Speaker 9:16 Crop', toolTag: 'MediaPipe' },
+  caption: { key: 'burning', label: 'Burning Dynamic Captions', toolTag: 'FFmpeg' },
+};
+
+function mapStepState(v: unknown): StepState {
+  const s = String(v ?? 'pending');
+  return s === 'active' || s === 'completed' || s === 'failed' ? s : 'pending';
+}
+
+function normalizeClip(raw: unknown): GeneratedClip {
+  const r = (raw ?? {}) as Record<string, unknown>;
+  const wordsRaw = Array.isArray(r.words) ? r.words : [];
+  const styleRaw = typeof r.caption_style === 'string' ? r.caption_style : r.captionStyle;
+  return {
+    id: String(r.id ?? ''),
+    title: String(r.title ?? 'Untitled clip'),
+    viralityScore: Number(r.virality_score ?? r.viralityScore ?? 0),
+    hookReasoning: String(r.hook_reasoning ?? r.hookReasoning ?? ''),
+    retentionInsight: String(r.retention_insight ?? r.retentionInsight ?? ''),
+    pacingNote: String(r.pacing_note ?? r.pacingNote ?? ''),
+    durationSec: Number(r.duration_sec ?? r.durationSec ?? 0),
+    startTimeSec: Number(r.start_time_sec ?? r.startTimeSec ?? 0),
+    endTimeSec: Number(r.end_time_sec ?? r.endTimeSec ?? 0),
+    aspectRatio: '9:16',
+    resolution: '1080x1920',
+    transcript: String(r.transcript ?? ''),
+    words: wordsRaw.map((w) => {
+      const ww = (w ?? {}) as Record<string, unknown>;
+      return {
+        word: String(ww.word ?? ww.w ?? ''),
+        start: Number(ww.start ?? ww.s ?? 0),
+        end: Number(ww.end ?? ww.e ?? 0),
+      };
+    }),
+    captionStyle: (typeof styleRaw === 'string' ? styleRaw : undefined) as
+      | CaptionStyleId
+      | undefined,
+  };
+}
+
+function normalizeJob(
+  data: unknown,
+  fallback: { sourceMode: 'url' | 'file'; targetDuration: number; numClips: number }
+): ClipJob {
+  const d = (data ?? {}) as Record<string, unknown>;
+  const rawSteps = Array.isArray(d.steps) ? d.steps : [];
+  const steps: PipelineStep[] = rawSteps.map((s) => {
+    const st = (s ?? {}) as Record<string, unknown>;
+    const mapped = STEP_MAP[String(st.id ?? '')] ?? {
+      key: 'downloading' as PipelineStep['key'],
+      label: String(st.title ?? 'Step'),
+      toolTag: '',
+    };
+    return {
+      key: mapped.key,
+      label: String(st.title ?? mapped.label),
+      toolTag: mapped.toolTag,
+      detail: String(st.detail ?? ''),
+      state: mapStepState(st.status ?? st.state),
+    };
+  });
+  const activeIdx = steps.findIndex((s) => s.state === 'active');
+  const status = String(d.status ?? 'queued');
+  return {
+    jobId: String(d.id ?? d.jobId ?? ''),
+    sourceType: fallback.sourceMode,
+    sourceUrl: typeof d.source_url === 'string' ? d.source_url : undefined,
+    platform: (typeof d.platform === 'string' ? d.platform : 'youtube') as VideoPlatform,
+    targetDuration: Number(d.target_duration ?? fallback.targetDuration),
+    numClips: Number(d.num_clips ?? fallback.numClips),
+    status:
+      status === 'queued' || status === 'processing' || status === 'completed' || status === 'failed'
+        ? status
+        : 'queued',
+    currentStepIndex:
+      activeIdx >= 0 ? activeIdx : steps.filter((s) => s.state === 'completed').length,
+    progressPercent: Number(d.progress ?? d.progressPercent ?? 0),
+    steps,
+    clips: (Array.isArray(d.clips) ? d.clips : []).map(normalizeClip),
+    errorMessage:
+      typeof d.error === 'string'
+        ? d.error
+        : typeof d.errorMessage === 'string'
+          ? d.errorMessage
+          : undefined,
+    createdAt: typeof d.created_at === 'string' ? d.created_at : new Date().toISOString(),
+  };
+}
 
 export default function App() {
   const urlInputRef = useRef<HTMLInputElement | null>(null);
@@ -18,6 +134,11 @@ export default function App() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [targetDuration, setTargetDuration] = useState<TargetDuration>(45);
   const [numClips, setNumClips] = useState<number>(5);
+  const [rangeStartText, setRangeStartText] = useState('');
+  const [rangeEndText, setRangeEndText] = useState('');
+  const [captionStyle, setCaptionStyle] = useState<CaptionStyleId>('karaoke');
+  const [musicUrl, setMusicUrl] = useState('');
+  const [retrimmingClipId, setRetrimmingClipId] = useState<string | null>(null);
 
   const [colabUrl, setColabUrl] = useState<string>(() => {
     try {
@@ -133,13 +254,18 @@ export default function App() {
         if (!res.ok) {
           throw new Error(`Status check failed (${res.status})`);
         }
-        const data = (await res.json()) as ClipJob;
-        setActiveJob(data);
+        const rawData = (await res.json()) as unknown;
+        const normalized = normalizeJob(rawData, {
+          sourceMode,
+          targetDuration,
+          numClips,
+        });
+        setActiveJob(normalized);
 
-        if (data.status === 'completed') {
+        if (normalized.status === 'completed') {
           stopPolling();
-          const normalizedClips = (data.clips || []).map((clip) => {
-            const downloadPath = `/api/download/${encodeURIComponent(data.jobId)}/${encodeURIComponent(clip.id)}`;
+          const normalizedClips = normalized.clips.map((clip) => {
+            const downloadPath = `/api/download/${encodeURIComponent(normalized.jobId)}/${encodeURIComponent(clip.id)}`;
             return {
               ...clip,
               videoUrl: `${apiBase}${downloadPath}`,
@@ -147,7 +273,7 @@ export default function App() {
             };
           });
           setClips(normalizedClips);
-        } else if (data.status === 'failed') {
+        } else if (normalized.status === 'failed') {
           stopPolling();
         }
       } catch (err) {
@@ -199,7 +325,7 @@ export default function App() {
       const platform = detectVideoPlatform(effectiveUrl);
       if (!platform) {
         setValidationError(
-          'Unsupported URL. Please enter a valid YouTube, Twitch, or Kick video link.'
+          'Unsupported URL. Please enter a valid YouTube, Twitch, Kick, Frame.io or direct MP4 video link.'
         );
         return;
       }
@@ -207,6 +333,20 @@ export default function App() {
 
     if (sourceMode === 'file' && !selectedFile) {
       setValidationError('Please select or drop a local MP4 video file first.');
+      return;
+    }
+
+    const startSec = parseTimeToSeconds(rangeStartText);
+    const endSec = parseTimeToSeconds(rangeEndText);
+    if (
+      (rangeStartText.trim() && startSec === null) ||
+      (rangeEndText.trim() && endSec === null)
+    ) {
+      setValidationError('Start/end time not understood — use MM:SS or HH:MM:SS.');
+      return;
+    }
+    if (startSec !== null && endSec !== null && endSec <= startSec) {
+      setValidationError('End time must be after start time.');
       return;
     }
 
@@ -222,6 +362,10 @@ export default function App() {
         formData.append('video', selectedFile);
         formData.append('clip_duration', String(targetDuration));
         formData.append('num_clips', String(numClips));
+        formData.append('start_sec', String(startSec ?? 0));
+        if (endSec !== null) formData.append('end_sec', String(endSec));
+        formData.append('caption_style', captionStyle);
+        if (musicUrl.trim()) formData.append('music_url', musicUrl.trim());
         response = await fetch(`${apiBase}/api/upload-video`, {
           method: 'POST',
           headers: backendHeaders(),
@@ -235,6 +379,10 @@ export default function App() {
             url: effectiveUrl,
             clip_duration: targetDuration,
             num_clips: numClips,
+            start_sec: startSec ?? 0,
+            end_sec: endSec,
+            caption_style: captionStyle,
+            music_url: musicUrl.trim() || null,
           }),
         });
       }
@@ -264,6 +412,51 @@ export default function App() {
     setClips((prev) =>
       prev.map((item) => (item.id === clipId ? { ...item, ...updates } : item))
     );
+  };
+
+  const handleRetrim = async (
+    clipId: string,
+    startSec: number,
+    endSec: number,
+    style: CaptionStyleId
+  ) => {
+    const apiBase = normalizeBackendUrl(colabUrl);
+    if (!apiBase || !activeJob) return;
+    setRetrimmingClipId(clipId);
+    try {
+      const response = await fetch(`${apiBase}/api/retrim`, {
+        method: 'POST',
+        headers: backendHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          job_id: activeJob.jobId,
+          clip_id: clipId,
+          start_sec: startSec,
+          end_sec: endSec,
+          caption_style: style,
+        }),
+      });
+      const payload = (await response.json()) as { clip?: unknown; detail?: string };
+      if (!response.ok || !payload.clip) {
+        throw new Error(payload.detail || `Re-render failed (${response.status})`);
+      }
+      const updated = normalizeClip(payload.clip);
+      const downloadPath = `/api/download/${encodeURIComponent(activeJob.jobId)}/${encodeURIComponent(clipId)}`;
+      const withUrls = {
+        ...updated,
+        videoUrl: `${apiBase}${downloadPath}`,
+        downloadUrl: `${apiBase}${downloadPath}`,
+      };
+      handleUpdateClip(clipId, withUrls);
+      setActiveJob((prev) =>
+        prev
+          ? { ...prev, clips: prev.clips.map((c) => (c.id === clipId ? withUrls : c)) }
+          : prev
+      );
+    } catch (err) {
+      setValidationError(err instanceof Error ? err.message : 'Re-render failed.');
+    } finally {
+      setRetrimmingClipId(null);
+    }
   };
 
   const handleNewClipClick = () => {
@@ -296,6 +489,14 @@ export default function App() {
           onTargetDurationChange={setTargetDuration}
           numClips={numClips}
           onNumClipsChange={setNumClips}
+          rangeStartText={rangeStartText}
+          onRangeStartChange={setRangeStartText}
+          rangeEndText={rangeEndText}
+          onRangeEndChange={setRangeEndText}
+          captionStyle={captionStyle}
+          onCaptionStyleChange={setCaptionStyle}
+          musicUrl={musicUrl}
+          onMusicUrlChange={setMusicUrl}
           colabUrl={colabUrl}
           onColabUrlChange={handleColabUrlChange}
           connectionStatus={connectionStatus}
@@ -314,6 +515,8 @@ export default function App() {
           clips={clips}
           colabBaseUrl={normalizeBackendUrl(colabUrl)}
           onUpdateClip={handleUpdateClip}
+          onRetrim={handleRetrim}
+          retrimmingClipId={retrimmingClipId}
         />
 
         <BackendSetupSection />
