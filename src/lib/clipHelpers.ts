@@ -97,6 +97,54 @@ export function formatTimecode(seconds: number): string {
   return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 }
 
+/** Format seconds as a plain clock time: 45 -> "0:45", 3600 -> "1:00:00". */
+export function formatClock(totalSeconds: number): string {
+  const safe = Math.max(0, Math.floor(totalSeconds));
+  const hours = Math.floor(safe / 3600);
+  const mins = Math.floor((safe % 3600) / 60);
+  const secs = safe % 60;
+  const mm = String(mins).padStart(2, '0');
+  const ss = String(secs).padStart(2, '0');
+  return hours > 0 ? `${hours}:${mm}:${ss}` : `${mins}:${ss}`;
+}
+
+/** A length of time in plain words: 45 -> "45 seconds", 1800 -> "30 minutes",
+ *  5400 -> "1 hour 30 minutes". */
+export function formatDurationWords(totalSeconds: number): string {
+  const safe = Math.max(0, Math.round(totalSeconds));
+  if (safe < 60) return safe === 1 ? '1 second' : `${safe} seconds`;
+  if (safe < 3600) {
+    const mins = Math.round(safe / 60);
+    return mins === 1 ? '1 minute' : `${mins} minutes`;
+  }
+  const hours = Math.floor(safe / 3600);
+  const mins = Math.round((safe % 3600) / 60);
+  const hourPart = hours === 1 ? '1 hour' : `${hours} hours`;
+  if (mins === 0) return hourPart;
+  return `${hourPart} ${mins === 1 ? '1 minute' : `${mins} minutes`}`;
+}
+
+/** Plain-language summary of a clip range, e.g. "Clips will come from the
+ *  first 30 minutes." An empty start means the video start, an empty end
+ *  means the video end. */
+export function describeRange(startText: string, endText: string): string {
+  const start = parseTimeToSeconds(startText);
+  const end = parseTimeToSeconds(endText);
+  if (start === null && end === null) {
+    return 'Clips can come from anywhere in the video.';
+  }
+  if ((start === null || start === 0) && end !== null) {
+    return `Clips will come from the first ${formatDurationWords(end)} of the video.`;
+  }
+  if (start !== null && end === null) {
+    return `Clips will come from ${formatClock(start)} to the end of the video.`;
+  }
+  if (start !== null && end !== null) {
+    return `Clips will come from ${formatClock(start)} to ${formatClock(end)} — that's ${formatDurationWords(end - start)} of video.`;
+  }
+  return 'Clips can come from anywhere in the video.';
+}
+
 export function retokenizeTranscript(transcript: string, totalDurationSec: number): WordToken[] {
   const cleaned = transcript
     .trim()
