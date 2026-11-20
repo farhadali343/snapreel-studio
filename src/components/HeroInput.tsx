@@ -9,9 +9,16 @@ import {
   Server,
   CheckCircle2,
   Loader2,
+  Clock,
 } from 'lucide-react';
 import type { CaptionStyleId, TargetDuration } from '../types/clip';
-import { detectVideoPlatform, formatPlatformLabel, DEFAULT_BACKEND_URL } from '../lib/clipHelpers';
+import {
+  detectVideoPlatform,
+  formatPlatformLabel,
+  DEFAULT_BACKEND_URL,
+  parseTimeToSeconds,
+  describeRange,
+} from '../lib/clipHelpers';
 
 export type ConnectionStatus = 'idle' | 'testing' | 'connected' | 'error';
 
@@ -58,6 +65,30 @@ const SAMPLE_LINKS = [
 ];
 
 const DURATION_OPTIONS: TargetDuration[] = [15, 30, 45, 60];
+
+/** One-tap clip ranges — no typing needed. "Auto" means the whole video:
+ *  SnapReel finds the best moments anywhere. A preset fills the From/To
+ *  boxes below, which stay editable for a custom range. */
+interface RangePreset {
+  id: string;
+  label: string;
+  start: string;
+  end: string;
+}
+
+const RANGE_PRESETS: RangePreset[] = [
+  { id: 'auto', label: 'Auto — best moments anywhere', start: '', end: '' },
+  { id: 'first30', label: 'First 30 min', start: '', end: '30:00' },
+  { id: 'first60', label: 'First 60 min', start: '', end: '1:00:00' },
+  { id: 'hour2', label: '60–120 min', start: '1:00:00', end: '2:00:00' },
+  { id: 'first120', label: 'First 2 hours', start: '', end: '2:00:00' },
+];
+
+const StepChip: React.FC<{ n: number }> = ({ n }) => (
+  <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-indigo-600 text-white text-[11px] font-bold mr-1.5 align-middle">
+    {n}
+  </span>
+);
 
 export const HeroInput: React.FC<HeroInputProps> = ({
   sourceMode,
@@ -120,6 +151,25 @@ export const HeroInput: React.FC<HeroInputProps> = ({
     onTargetDurationChange(sec);
   };
 
+  const applyRangePreset = (preset: RangePreset) => {
+    onRangeStartChange(preset.start);
+    onRangeEndChange(preset.end);
+  };
+
+  const isPresetActive = (preset: RangePreset) => {
+    const curStart = parseTimeToSeconds(rangeStartText) ?? 0;
+    const presetStart = parseTimeToSeconds(preset.start) ?? 0;
+    return (
+      curStart === presetStart &&
+      parseTimeToSeconds(rangeEndText) === parseTimeToSeconds(preset.end)
+    );
+  };
+
+  const rangeSummary = describeRange(rangeStartText, rangeEndText);
+  const isCustomRange =
+    (rangeStartText.trim() !== '' || rangeEndText.trim() !== '') &&
+    !RANGE_PRESETS.some((p) => isPresetActive(p));
+
   const detectedPlatform = detectVideoPlatform(urlInput);
 
   const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
@@ -147,8 +197,8 @@ export const HeroInput: React.FC<HeroInputProps> = ({
           Turn long-form videos into viral 9:16 vertical clips
         </h1>
         <p className="mt-4 text-base sm:text-lg text-slate-600 max-w-2xl mx-auto leading-relaxed">
-          Connect your Google Colab backend, drop a stream link or MP4 file, and render real
-          1080×1920 vertical shorts with Whisper captions and active-speaker framing.
+          Paste a long video link. SnapReel finds the best moments and cuts them into vertical
+          clips for Shorts, TikTok and Reels — with word-by-word captions.
         </p>
       </div>
 
@@ -258,7 +308,7 @@ export const HeroInput: React.FC<HeroInputProps> = ({
           {sourceMode === 'url' ? (
             <div className="space-y-3">
               <label htmlFor="video-url-input" className="block text-sm font-medium text-slate-700">
-                Video or VOD Link
+                <StepChip n={1} /> Video link
               </label>
               <div className="relative flex items-center">
                 <Link2
@@ -315,7 +365,7 @@ export const HeroInput: React.FC<HeroInputProps> = ({
           ) : (
             <div className="space-y-3">
               <label className="block text-sm font-medium text-slate-700">
-                Local Video File (MP4, MOV, WebM)
+                <StepChip n={1} /> Local video file (MP4, MOV, WebM)
               </label>
               <div
                 onDragOver={(e) => {
@@ -406,35 +456,76 @@ export const HeroInput: React.FC<HeroInputProps> = ({
               <div>
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-sm font-medium text-slate-700">
-                    Clip only this part{' '}
-                    <span className="text-slate-400 font-normal">(optional)</span>
+                    <StepChip n={2} /> Which part should the clips come from?
                   </span>
                   <span className="text-[11px] text-slate-400">
                     No extra time or credits — only this part is processed
                   </span>
                 </div>
-                <div className="mt-2 flex flex-col sm:flex-row gap-2.5">
-                  <input
-                    type="text"
-                    inputMode="numeric"
-                    value={rangeStartText}
-                    onChange={(e) => onRangeStartChange(e.target.value)}
-                    placeholder="Start — e.g. 1:05:00"
-                    aria-label="Range start time"
-                    className="flex-1 h-11 px-3.5 text-sm font-mono-tabular text-slate-900 placeholder:text-slate-400 bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-600 focus:border-transparent transition-colors"
-                  />
-                  <input
-                    type="text"
-                    inputMode="numeric"
-                    value={rangeEndText}
-                    onChange={(e) => onRangeEndChange(e.target.value)}
-                    placeholder="End — e.g. 2:00:00 (blank = video end)"
-                    aria-label="Range end time"
-                    className="flex-1 h-11 px-3.5 text-sm font-mono-tabular text-slate-900 placeholder:text-slate-400 bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-600 focus:border-transparent transition-colors"
-                  />
+
+                {/* One-tap presets — no typing needed. */}
+                <div
+                  className="mt-3 flex flex-wrap gap-2"
+                  role="group"
+                  aria-label="Clip range presets"
+                >
+                  {RANGE_PRESETS.map((preset) => {
+                    const active = isPresetActive(preset);
+                    return (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        aria-pressed={active}
+                        onClick={() => applyRangePreset(preset)}
+                        className={`px-3 py-1.5 text-xs font-semibold rounded-full border transition-colors whitespace-nowrap cursor-pointer ${
+                          active
+                            ? 'bg-indigo-600 text-white border-indigo-600 shadow-sm'
+                            : 'bg-white text-slate-700 border-slate-200 hover:border-indigo-300 hover:text-indigo-700'
+                        }`}
+                      >
+                        {preset.label}
+                      </button>
+                    );
+                  })}
+                  {isCustomRange && (
+                    <span className="px-3 py-1.5 text-xs font-semibold rounded-full bg-amber-50 text-amber-700 border border-amber-200">
+                      Custom range
+                    </span>
+                  )}
                 </div>
+
+                <div className="mt-3 flex flex-col sm:flex-row gap-2.5">
+                  <label className="flex-1">
+                    <span className="block text-xs font-medium text-slate-500 mb-1">From</span>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      value={rangeStartText}
+                      onChange={(e) => onRangeStartChange(e.target.value)}
+                      placeholder="0:00"
+                      aria-label="Range start time"
+                      className="w-full h-11 px-3.5 text-sm font-mono-tabular text-slate-900 placeholder:text-slate-400 bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-600 focus:border-transparent transition-colors"
+                    />
+                  </label>
+                  <label className="flex-1">
+                    <span className="block text-xs font-medium text-slate-500 mb-1">To</span>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      value={rangeEndText}
+                      onChange={(e) => onRangeEndChange(e.target.value)}
+                      placeholder="Video end"
+                      aria-label="Range end time"
+                      className="w-full h-11 px-3.5 text-sm font-mono-tabular text-slate-900 placeholder:text-slate-400 bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-600 focus:border-transparent transition-colors"
+                    />
+                  </label>
+                </div>
+                <p className="mt-2 flex items-start gap-1.5 text-xs text-indigo-700 bg-indigo-50 border border-indigo-100 rounded-lg px-3 py-2">
+                  <Clock className="w-3.5 h-3.5 shrink-0 mt-px" aria-hidden="true" />
+                  <span>{rangeSummary}</span>
+                </p>
                 <p className="mt-1.5 text-xs text-slate-500">
-                  Times as MM:SS or HH:MM:SS. Leave blank to clip the whole video.
+                  Tap a preset above, or type a time like 30:00 (minutes) or 1:00:00 (hours).
                 </p>
               </div>
 
@@ -495,7 +586,11 @@ export const HeroInput: React.FC<HeroInputProps> = ({
           )}
 
           {/* Duration, Clip Count & Submit Row */}
-          <div className="mt-6 pt-5 border-t border-slate-100 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          <div className="mt-6 pt-5 border-t border-slate-100 space-y-4">
+            <p className="text-sm font-medium text-slate-700">
+              <StepChip n={3} /> Clip size — how long should each clip be, and how many?
+            </p>
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
             <div className="flex flex-wrap items-center gap-5">
               <div className="flex items-center gap-2.5 flex-wrap">
                 <span className="text-sm font-medium text-slate-700 whitespace-nowrap">
@@ -579,6 +674,7 @@ export const HeroInput: React.FC<HeroInputProps> = ({
               <Scissors className="w-4 h-4" aria-hidden="true" />
               {isSubmitting ? 'Starting Pipeline...' : 'Generate Viral Clips'}
             </button>
+            </div>
           </div>
 
           <p className="mt-3 text-xs text-slate-400 text-center lg:text-right">
