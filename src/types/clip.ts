@@ -39,6 +39,7 @@ export interface GeneratedClip {
   id: string;
   title: string;
   viralityScore: number;
+  momentType?: string;
   hookReasoning: string;
   retentionInsight: string;
   pacingNote: string;
