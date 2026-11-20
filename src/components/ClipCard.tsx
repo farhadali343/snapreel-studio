@@ -14,7 +14,7 @@ import {
   Scissors,
 } from 'lucide-react';
 import type { CaptionStyleId, GeneratedClip } from '../types/clip';
-import { formatTimecode, retokenizeTranscript } from '../lib/clipHelpers';
+import { backendHeaders, formatTimecode, retokenizeTranscript } from '../lib/clipHelpers';
 import { CAPTION_STYLE_OPTIONS } from './HeroInput';
 
 interface ClipCardProps {
@@ -57,6 +57,103 @@ export const ClipCard: React.FC<ClipCardProps> = ({
   );
   const [retrimError, setRetrimError] = useState<string | null>(null);
 
+  // Preview + download fetch the clip as a blob with the ngrok header.
+  // A plain <video src> or <a href> cannot send that header, so ngrok's
+  // free tier answers with its warning page instead of the MP4 — that is
+  // why previews showed "Unable to stream preview" and downloads opened
+  // a new tab on the warning page. One shared fetch per clip; the blob
+  // URL is reused by both the player and the download button.
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [isLoadingPreview, setIsLoadingPreview] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [isPreparingDownload, setIsPreparingDownload] = useState(false);
+  const blobPromiseRef = useRef<Promise<Blob> | null>(null);
+  const objectUrlRef = useRef<string | null>(null);
+  const autoPlayRef = useRef(false);
+
+  const ensureClipBlob = () => {
+    if (!blobPromiseRef.current) {
+      blobPromiseRef.current = fetch(backendClipUrl, {
+        headers: backendHeaders(),
+      })
+        .then((res) => {
+          if (!res.ok) {
+            throw new Error(`clip fetch failed (HTTP ${res.status})`);
+          }
+          return res.blob();
+        })
+        .catch((err) => {
+          blobPromiseRef.current = null; // allow retry
+          throw err;
+        });
+    }
+    return blobPromiseRef.current;
+  };
+
+  const loadPreview = async (): Promise<string | null> => {
+    if (objectUrlRef.current) {
+      setPreviewUrl(objectUrlRef.current);
+      return objectUrlRef.current;
+    }
+    setIsLoadingPreview(true);
+    setPreviewError(null);
+    try {
+      const blob = await ensureClipBlob();
+      const url = URL.createObjectURL(blob);
+      objectUrlRef.current = url;
+      setPreviewUrl(url);
+      return url;
+    } catch {
+      setPreviewError(
+        'Preview could not be loaded. Check the Colab backend is running, then tap play to retry.'
+      );
+      return null;
+    } finally {
+      setIsLoadingPreview(false);
+    }
+  };
+
+  const handleDownload = async () => {
+    if (isPreparingDownload) return;
+    setIsPreparingDownload(true);
+    try {
+      const blob = await ensureClipBlob();
+      if (!objectUrlRef.current) {
+        objectUrlRef.current = URL.createObjectURL(blob);
+      }
+      const a = document.createElement('a');
+      a.href = objectUrlRef.current;
+      a.download = `${downloadSlug || clip.id}-1080x1920.mp4`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch {
+      setPreviewError(
+        'Download failed. Check the Colab backend is running, then try again.'
+      );
+    } finally {
+      setIsPreparingDownload(false);
+    }
+  };
+
+  useEffect(
+    () => () => {
+      if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+    },
+    []
+  );
+
+  useEffect(() => {
+    if (!previewUrl || !autoPlayRef.current) return;
+    autoPlayRef.current = false;
+    const vid = videoRef.current;
+    if (!vid) return;
+    vid
+      .play()
+      .then(() => setIsPlaying(true))
+      .catch(() => setIsPlaying(false));
+  }, [previewUrl]);
+
   const backendClipUrl = useMemo(() => {
     const cleanBase = colabBaseUrl.trim().replace(/\/+$/, '');
     if (clip.downloadUrl && clip.downloadUrl.startsWith('http')) {
@@ -67,6 +164,12 @@ export const ClipCard: React.FC<ClipCardProps> = ({
     }
     return `${cleanBase}/api/download/${encodeURIComponent(jobId)}/${encodeURIComponent(clip.id)}`;
   }, [colabBaseUrl, jobId, clip.id, clip.downloadUrl]);
+
+  const downloadSlug = clip.title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '')
+    .slice(0, 40);
 
   useEffect(() => {
     setDraftTitle(clip.title);
@@ -107,21 +210,37 @@ export const ClipCard: React.FC<ClipCardProps> = ({
       vid.removeEventListener('timeupdate', handleTimeUpdate);
       vid.removeEventListener('ended', handleEnded);
     };
-  }, [backendClipUrl]);
+  }, [previewUrl]);
 
   const togglePlay = async () => {
+    if (isPlaying) {
+      videoRef.current?.pause();
+      setIsPlaying(false);
+      return;
+    }
+    if (isLoadingPreview) return;
+    if (videoError) {
+      // Blob was fetched but the video element could not play it: fetch fresh
+      setVideoError(false);
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+        objectUrlRef.current = null;
+      }
+      blobPromiseRef.current = null;
+      setPreviewUrl(null);
+    }
+    if (!previewUrl || videoError) {
+      autoPlayRef.current = true;
+      await loadPreview();
+      return;
+    }
     const vid = videoRef.current;
     if (!vid) return;
-    if (isPlaying) {
-      vid.pause();
+    try {
+      await vid.play();
+      setIsPlaying(true);
+    } catch {
       setIsPlaying(false);
-    } else {
-      try {
-        await vid.play();
-        setIsPlaying(true);
-      } catch {
-        setIsPlaying(false);
-      }
     }
   };
 
@@ -174,20 +293,26 @@ export const ClipCard: React.FC<ClipCardProps> = ({
         ? 'text-indigo-700 bg-indigo-50 border-indigo-200'
         : 'text-amber-700 bg-amber-50 border-amber-200';
 
-  const downloadSlug = clip.title
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/(^-|-$)/g, '')
-    .slice(0, 40);
+  const momentBadge: Record<string, { label: string; classes: string }> = {
+    wtf: { label: 'WTF', classes: 'text-amber-700 bg-amber-50 border-amber-200' },
+    funny: { label: 'Funny', classes: 'text-emerald-700 bg-emerald-50 border-emerald-200' },
+    extreme_reaction: {
+      label: 'Extreme reaction',
+      classes: 'text-rose-700 bg-rose-50 border-rose-200',
+    },
+    insight: { label: 'Insight', classes: 'text-sky-700 bg-sky-50 border-sky-200' },
+    story: { label: 'Story', classes: 'text-violet-700 bg-violet-50 border-violet-200' },
+  };
+  const moment = clip.momentType ? momentBadge[clip.momentType] : undefined;
 
   return (
     <article className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden flex flex-col">
       {/* 9:16 Vertical Video Preview Viewport */}
       <div className="relative aspect-[9/16] bg-slate-900 overflow-hidden select-none group">
-        {!videoError ? (
+        {previewUrl && !videoError ? (
           <video
             ref={videoRef}
-            src={backendClipUrl}
+            src={previewUrl}
             muted={isMuted}
             playsInline
             loop
@@ -200,7 +325,11 @@ export const ClipCard: React.FC<ClipCardProps> = ({
             <Film className="w-10 h-10 text-indigo-400 mb-3" />
             <p className="font-display text-sm font-semibold">{clip.title}</p>
             <p className="mt-1 text-xs text-slate-400">
-              Unable to stream preview. Use Download 1080x1920 MP4 below.
+              {videoError
+                ? 'Unable to play this clip in the browser. Try Download below, or tap play to retry.'
+                : isLoadingPreview
+                  ? 'Loading preview…'
+                  : (previewError ?? 'Tap play to load the preview.')}
             </p>
           </div>
         )}
@@ -316,11 +445,21 @@ export const ClipCard: React.FC<ClipCardProps> = ({
       {/* Card Body: Virality Score, Reasoning, Editable Hook & Transcript, Direct MP4 Download */}
       <div className="p-5 flex-1 flex flex-col gap-4">
         <div className="flex items-center justify-between gap-2">
-          <div
-            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-semibold font-mono-tabular ${scoreTone}`}
-          >
-            <span>{clip.viralityScore}/100</span>
-            <span className="font-sans font-medium">Virality Score</span>
+          <div className="flex items-center gap-2">
+            <div
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-semibold font-mono-tabular ${scoreTone}`}
+            >
+              <span>{clip.viralityScore}/100</span>
+              <span className="font-sans font-medium">Virality Score</span>
+            </div>
+
+            {moment && (
+              <span
+                className={`inline-flex items-center px-2.5 py-1 rounded-lg border text-xs font-semibold ${moment.classes}`}
+              >
+                {moment.label}
+              </span>
+            )}
           </div>
 
           <span className="font-mono-tabular text-xs text-slate-500">
@@ -487,15 +626,16 @@ export const ClipCard: React.FC<ClipCardProps> = ({
           </div>
         )}
 
-        {/* Direct MP4 Download Link from Colab Backend */}
-        <a
-          href={backendClipUrl}
-          download={`${downloadSlug || clip.id}-1080x1920.mp4`}
-          className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 rounded-xl transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-600 focus-visible:ring-offset-2"
+        {/* Direct MP4 Download from Colab Backend (blob fetch: same tab, no ngrok warning page) */}
+        <button
+          type="button"
+          onClick={handleDownload}
+          disabled={isPreparingDownload}
+          className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 disabled:opacity-60 rounded-xl transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-600 focus-visible:ring-offset-2 cursor-pointer"
         >
           <Download className="w-4 h-4 shrink-0" aria-hidden="true" />
-          Download 1080x1920 MP4
-        </a>
+          {isPreparingDownload ? 'Preparing download…' : 'Download 1080x1920 MP4'}
+        </button>
       </div>
     </article>
   );
