@@ -36,6 +36,15 @@ export function detectVideoPlatform(inputUrl: string): VideoPlatform | null {
     if (host === 'kick.com') {
       return 'kick';
     }
+    // Frame.io share links are NOT supported (no yt-dlp extractor) — only
+    // a direct .mp4 link works, which the backend cuts with ffmpeg.
+    if (host.includes('frame.io')) {
+      return 'frameio';
+    }
+    // Direct video file links (e.g. Frame.io / S3 / CDN .mp4 URLs).
+    if (/\.(mp4|mov|webm|mkv|m4v)(\?|#|$)/i.test(trimmed)) {
+      return 'direct-mp4';
+    }
     return null;
   } catch {
     return null;
@@ -52,7 +61,33 @@ export function formatPlatformLabel(platform: VideoPlatform): string {
       return 'Kick';
     case 'local':
       return 'Local MP4';
+    case 'direct-mp4':
+      return 'Direct MP4';
+    case 'frameio':
+      return 'Frame.io';
+    case 'upload':
+      return 'Upload';
+    default:
+      return String(platform);
   }
+}
+
+/** Parse "SS", "MM:SS" or "HH:MM:SS" into seconds. Returns null when the
+ *  text is empty or not a valid time (the caller then treats it as unset). */
+export function parseTimeToSeconds(text: string): number | null {
+  const t = text.trim();
+  if (!t) return null;
+  if (/^\d+(\.\d+)?$/.test(t)) {
+    const v = parseFloat(t);
+    return Number.isFinite(v) && v >= 0 ? v : null;
+  }
+  const parts = t.split(':').map((p) => p.trim());
+  if (parts.length < 2 || parts.length > 3) return null;
+  if (!parts.every((p) => /^\d+(\.\d+)?$/.test(p))) return null;
+  const nums = parts.map(Number);
+  let seconds = 0;
+  for (const n of nums) seconds = seconds * 60 + n;
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds : null;
 }
 
 export function formatTimecode(seconds: number): string {
